@@ -6,6 +6,8 @@ from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from message_filters import Subscriber, TimeSynchronizer
 from dre.msg import RadarInfo, LocalMapInfo
+from tf2_ros import TransformBroadcaster
+from geometry_msgs.msg import TransformStamped
 import numpy as np
 import yaml
 import copy
@@ -42,6 +44,10 @@ class DroNode(Node):
         # Set the local map publishers
         self.local_map_image_publisher = self.create_publisher(Image, 'dro_local_map_image', 10)
         self.local_map_info_publisher = self.create_publisher(LocalMapInfo, 'dro_local_map_info', 10)
+
+        # Needed for rviz's "radar"-following camera view (XYOrbit Target Frame):
+        # view controllers only track TF frames, not topics.
+        self.tf_broadcaster = TransformBroadcaster(self)
 
         # Get the output path from the parameters
         self.declare_parameter('output_path', 'output')
@@ -246,6 +252,20 @@ class DroNode(Node):
         odom_msg.pose.pose.orientation.z = quaternion[2]
         odom_msg.pose.pose.orientation.w = quaternion[3]
         self.odometry_publisher.publish(odom_msg)
+
+        # Broadcast the same pose as a TF transform (see the comment on tf_broadcaster above)
+        transform = TransformStamped()
+        transform.header.stamp = odom_msg.header.stamp
+        transform.header.frame_id = "odom"
+        transform.child_frame_id = "radar"
+        transform.transform.translation.x = pose[0, 3]
+        transform.transform.translation.y = pose[1, 3]
+        transform.transform.translation.z = 0.0
+        transform.transform.rotation.x = quaternion[0]
+        transform.transform.rotation.y = quaternion[1]
+        transform.transform.rotation.z = quaternion[2]
+        transform.transform.rotation.w = quaternion[3]
+        self.tf_broadcaster.sendTransform(transform)
 
 
     def logOdometry(self, pose, timestamp):
