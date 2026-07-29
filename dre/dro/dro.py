@@ -53,6 +53,7 @@ kDefaultDroOpts = {
     },
     'log': {
         'save_local_maps': True,
+        'save_cumulative_image': True,
     },
 }
 
@@ -89,6 +90,7 @@ class Dro():
             self.estimate_vy_bias = opts['estimation']['estimate_vy_bias']
             self.vy_bias = opts['estimation']['vy_bias_prior']
             self.save_local_maps = opts['log']['save_local_maps']
+            self.save_cumulative_image = opts['log']['save_cumulative_image']
 
 
             # Initialise the GP parameters
@@ -418,15 +420,26 @@ class Dro():
                     self.local_map = self.one_minus_alpha * self.local_map + self.alpha * local_map_update
 
 
-                # Publish the local map for dr_pogo
+                # Publish/write the local map and cumulative returns for dr_pogo.
+                # The cumulative image is only needed by mapping_node (live) or
+                # for saving to disk (offline datasets); skip its computation
+                # entirely when no one wants it (e.g. localization mode) since
+                # it costs a second GPU->CPU sync on top of the local map's.
                 to_publish_local_map = (self.local_map.clip(0, 1) * 255.0).to(torch.uint8).detach().cpu().numpy()
-                self.node.publishLocalMap(to_publish_local_map, np.array([self.current_pos[0].item(), self.current_pos[1].item(), self.current_rot.item()]), timestamps[0])
-                if self.save_local_maps:
+                current_xy_theta = np.array([self.current_pos[0].item(), self.current_pos[1].item(), self.current_rot.item()])
+                local_map_update_cumulative = None
+                if self.save_cumulative_image or self.node.cumulativeReturnsNeeded():
                     prev_shifted_cumulative = torch.cumsum(prev_shifted, dim=1)
                     polar_target_cumulative = self.bilinearInterpolation(prev_shifted_cumulative, polar_coord_corrected)
                     polar_target_cumulative = torch.concatenate((polar_target_cumulative, polar_target_cumulative[0,:].unsqueeze(0)), dim=0)
                     local_map_update_cumulative = self.bilinearInterpolation(polar_target_cumulative, temp_polar_to_interp).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-                    self.node.writeLocalMap(to_publish_local_map, local_map_update_cumulative, np.array([self.current_pos[0].item(), self.current_pos[1].item(), self.current_rot.item()]), timestamps[0])
+                    self.node.publishCumulativeReturns(local_map_update_cumulative, timestamps[0])
+
+                self.node.publishLocalMap(to_publish_local_map, current_xy_theta, timestamps[0])
+                if self.save_local_maps:
+                    self.node.writeLocalMap(to_publish_local_map, current_xy_theta, timestamps[0])
+                if self.save_cumulative_image:
+                    self.node.writeCumulativeImage(local_map_update_cumulative, timestamps[0])
 
 
                 # Blur and normalise the local map

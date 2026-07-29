@@ -43,6 +43,7 @@ class DroNode(Node):
 
         # Set the local map publishers
         self.local_map_image_publisher = self.create_publisher(Image, 'dro_local_map_image', 10)
+        self.cumulated_returns_image_publisher = self.create_publisher(Image, 'dro_cumulated_returns_image', 10)
         self.local_map_info_publisher = self.create_publisher(LocalMapInfo, 'dro_local_map_info', 10)
 
         # Needed for rviz's "radar"-following camera view (XYOrbit Target Frame):
@@ -150,10 +151,6 @@ class DroNode(Node):
             if os.path.exists(self.local_map_output_path):
                 os.system('rm -r ' + self.local_map_output_path)
             os.makedirs(self.local_map_output_path)
-            self.cumulative_return_output_path = os.path.join(self.seq_output_folder, "cumulated_returns")
-            if os.path.exists(self.cumulative_return_output_path):
-                os.system('rm -r ' + self.cumulative_return_output_path)
-            os.makedirs(self.cumulative_return_output_path)
 
             self.odometry_2d_output_path = os.path.join(self.seq_output_folder, "odometry_2d")
             if os.path.exists(self.odometry_2d_output_path):
@@ -167,6 +164,14 @@ class DroNode(Node):
                     os.system('rm -r ' + self.odometry_3d_output_path)
                 os.makedirs(self.odometry_3d_output_path)
                 self.odometry_3d_output_path = os.path.join(self.odometry_3d_output_path, seq_ID + '.txt')
+
+        # Independent of save_local_maps: create the cumulative-returns folder only
+        # if that's separately enabled.
+        if self.dro_opts['log']['save_cumulative_image']:
+            self.cumulative_return_output_path = os.path.join(self.seq_output_folder, "cumulated_returns")
+            if os.path.exists(self.cumulative_return_output_path):
+                os.system('rm -r ' + self.cumulative_return_output_path)
+            os.makedirs(self.cumulative_return_output_path)
 
         self.initialized = True
 
@@ -331,6 +336,10 @@ class DroNode(Node):
             df_odom.to_csv(self.odometry_3d_output_path, mode='a', header=None, index=None, sep=' ')
 
 
+    # True when a subscriber (e.g. mapping_node) wants the cumulative returns image
+    def cumulativeReturnsNeeded(self):
+        return self.cumulated_returns_image_publisher.get_subscription_count() > 0
+
     # Input local map needs to be in [0, 255] uint8 format np array
     def publishLocalMap(self, local_map, xy_theta, timestamp):
         if local_map.dtype != np.uint8:
@@ -367,10 +376,22 @@ class DroNode(Node):
         self.local_map_odometry_publisher.publish(local_map_odom_msg)
 
 
-    # Input local_map and cumulated_returns needs to be in [0, 255] uint8 format np array
-    def writeLocalMap(self, local_map, cumulated_returns, xy_theta, timestamp):
+    # Input cumulated_returns needs to be in [0, 255] uint8 format np array
+    def publishCumulativeReturns(self, cumulated_returns, timestamp):
+        if cumulated_returns.dtype != np.uint8:
+            self.get_logger().error(f"Cumulated returns numpy array has dtype {cumulated_returns.dtype}, expected uint8.")
+            return
+
+        cumulated_returns_image_msg = self.bridge.cv2_to_imgmsg(cumulated_returns, encoding="mono8")
+        cumulated_returns_image_msg.header.stamp.sec = int(timestamp // 1e6)
+        cumulated_returns_image_msg.header.stamp.nanosec = int((timestamp % 1e6) * 1e3)
+        cumulated_returns_image_msg.header.frame_id = "radar"
+        self.cumulated_returns_image_publisher.publish(cumulated_returns_image_msg)
+
+
+    # Input local map needs to be in [0, 255] uint8 format np array
+    def writeLocalMap(self, local_map, xy_theta, timestamp):
         cv2.imwrite(os.path.join(self.local_map_output_path, str(timestamp) + '.png'), local_map)
-        cv2.imwrite(os.path.join(self.cumulative_return_output_path, str(timestamp) + '.png'), cumulated_returns)
 
         df_data_2d = pd.DataFrame(np.array([timestamp, xy_theta[0], xy_theta[1], xy_theta[2]]).reshape(1, -1))
         df_data_2d[0] = df_data_2d[0].astype(np.int64)
@@ -378,6 +399,11 @@ class DroNode(Node):
             df_data_2d.to_csv(self.odometry_2d_output_path, header=None, index=None, sep=' ')
         else:
             df_data_2d.to_csv(self.odometry_2d_output_path, mode='a', header=None, index=None, sep=' ')
+
+
+    # Input cumulated_returns needs to be in [0, 255] uint8 format np array
+    def writeCumulativeImage(self, cumulated_returns, timestamp):
+        cv2.imwrite(os.path.join(self.cumulative_return_output_path, str(timestamp) + '.png'), cumulated_returns)
 
 
 
