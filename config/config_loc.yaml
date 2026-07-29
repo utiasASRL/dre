@@ -1,0 +1,46 @@
+# map_path: path to the voxel_map.bin produced by dr_map / dr_ba
+# map_path: /home/asrl/ros2_ws/dr_ba/output/maps/glen/boreas-2024-12-03-12-54/voxel_map.bin
+map_path: /home/asrl/ros2_ws/install/dre/share/dre/output/boreas-live/voxel_map.bin
+
+# Localization visualization parameters
+loc_viz:
+  scan_res: 0.1               # m / pixel — must match the scan publisher
+  scan_display_radius_m: 120.0 # clip scan circle to this radius (metres)
+  veh_len: 6.0                # vehicle length for pose triangles (metres)
+  veh_wid: 3.0                # vehicle width for pose triangles (metres)
+  zoom_range: 120.0            # half-width of the view window (meters)
+  fig_size_px: 400            # figure size in pixels
+  dpi: 100                    # dots per inch
+
+# voxel_map_resolution: resolution of the voxel map (meters)
+voxel_map_resolution: 0.1
+
+# num_triangles: number of pose trail triangles to display (-1 for unlimited)
+num_triangles: 10
+
+# num_threads: number of threads for parallel processing (OpenMP)
+num_threads: 20
+
+# initial_pose: starting estimate of the robot's pose in the map frame (meters / radians).
+# Must be set close enough for the optimizer to converge on the first scan.
+initial_pose:
+  x: 0.0
+  y: 0.0
+  theta: 0.0   # radians
+  skip_selector: false  # if true, use initial_pose values directly without interactive selector
+
+frame_processing:
+  max_dist: 120.0           # radius (m) around current pose to query map voxels
+  gauss_blur_sigma: 19.0    # Gaussian blur kernel sigma (pixels) applied to incoming scan
+  gauss_blur_ksize: 19     # Gaussian blur kernel size (must be odd); formula: (int(ceil(3 * sigma)) | 1)
+  adaptive_blur: false     # if true, sigma grows until min_percent_nonzero is met
+  min_int_val_tol: 0.5     # pixel threshold for counting a pixel as non-zero
+  min_percent_nonzero: 0.3 # target non-zero fraction when adaptive_blur is enabled
+  max_blur_sigma: 15.0     # upper bound on sigma for adaptive blur
+
+optimization:
+  max_iterations: 8
+  convergence_tol: 1.0e-3
+  alpha: 1.0          # Gauss-Newton step size
+  meas_std: 1.0       # intensity measurement noise std-dev (normalised [0,1] scale)
+  range_factor: 0.0   # adds range-dependent intensity uncertainty

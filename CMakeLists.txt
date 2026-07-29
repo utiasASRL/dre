@@ -121,5 +121,69 @@ install(TARGETS pogo_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
+add_executable(mapping_node
+  dre/ba/mapping_node.cpp
+)
+target_include_directories(mapping_node PRIVATE
+  ${EIGEN3_INCLUDE_DIRS}
+)
+ament_target_dependencies(mapping_node rclcpp sensor_msgs std_msgs nav_msgs message_filters)
+target_link_libraries(mapping_node ${PROJECT_NAME}__rosidl_typesupport_cpp ba)
+
+# Link remaining libraries
+target_link_libraries(mapping_node
+  ${OpenCV_LIBS}
+  OpenMP::OpenMP_CXX
+)
+
+if(TARGET yaml-cpp::yaml-cpp)
+  target_link_libraries(mapping_node yaml-cpp::yaml-cpp)
+else()
+  target_link_libraries(mapping_node yaml-cpp)
+endif()
+
+install(TARGETS mapping_node DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS
+  dre/ba/map_viz_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME map_viz_node
+)
+
+add_executable(loc_node
+  dre/drl/loc_node.cpp
+)
+target_include_directories(loc_node PRIVATE
+  ${EIGEN3_INCLUDE_DIRS}
+)
+ament_target_dependencies(loc_node rclcpp sensor_msgs std_msgs message_filters)
+target_link_libraries(loc_node ${PROJECT_NAME}__rosidl_typesupport_cpp ba)
+
+# Link remaining libraries
+target_link_libraries(loc_node
+  ${OpenCV_LIBS}
+  OpenMP::OpenMP_CXX
+)
+
+if(TARGET yaml-cpp::yaml-cpp)
+  target_link_libraries(loc_node yaml-cpp::yaml-cpp)
+else()
+  target_link_libraries(loc_node yaml-cpp)
+endif()
+
+install(TARGETS loc_node DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS
+  dre/drl/loc_viz_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME loc_viz_node
+)
+
+install(PROGRAMS
+  dre/drl/initial_pose_selector.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME initial_pose_selector
+)
+
 
 ament_package()

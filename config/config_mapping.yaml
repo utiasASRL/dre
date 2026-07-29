@@ -1,0 +1,59 @@
+# voxel_map_resolution: resolution of the persistent voxel map (meters)
+voxel_map_resolution: 1.0
+
+# max_dist: radius (m) around each incoming local map's pose to allocate/update voxels
+max_dist: 120.0
+
+# map_update_period_sec: how often (seconds) to save the map to disk and publish its path
+map_update_period_sec: 1.0
+
+# max_kf_dist: minimum translation (m) since the last added scan to add a new one
+max_kf_dist: 5.0
+
+# max_kf_rot: minimum rotation (degrees) since the last added scan to add a new one
+max_kf_rot: 30.0
+
+# cumul_thresh: threshold to ignore measurements with too high a cumulative return
+cumul_thresh: 0.9
+
+# zero_thresh: max cumulative return threshold to consider a measurement as zero return
+zero_thresh: 0.2
+
+# meas_std: intensity measurement noise std (intensity units)
+meas_std: 0.1
+
+# range_factor: factor to scale range uncertainty to intensity uncertainty
+range_factor: 0.0005
+
+# num_threads: OpenMP threads for the map recompute (0 = use all available)
+num_threads: 10
+
+# max_loaded_scans: scans kept loaded in memory between recomputes (<1 = all).
+# Each loaded scan holds its local map + cumulative image (~32 MB for 2001x2001)
+max_loaded_scans: 100
+
+# pose_update_tol: re-integrate a scan when its pose-graph estimate has moved
+# by more than this (meters of displacement at the edge of its update region)
+pose_update_tol: 0.2
+
+# max_moved_per_update: max pose-corrected scans re-integrated per update cycle
+# (<1 = unbounded). Bounds the work a loop closure triggers at once so scan
+# intake and map saves keep flowing; remaining scans are corrected on
+# subsequent cycles, worst-error first.
+max_moved_per_update: 20
+
+# min_moved_per_update: pose corrections guaranteed per update cycle before the
+# worker yields to newly queued keyframes. Raise to heal loop closures faster
+# (at ~0.5 s of added keyframe latency per correction); lower to prioritize
+# fresh scans.
+min_moved_per_update: 5
+
+# map_viz: parameters for map_viz_node's rendering of the live map
+map_viz:
+  publish_hz: 4               # visualization publish rate
+  dpi: 100                    # dots per inch (output resolution = fig_size * dpi)
+  dot_radius: 4               # dot marker size in points
+  plot_poses: false           # overlay map-node pose triangles when the map (re)loads
+  veh_len: 6.0                # vehicle length for pose triangles (metres)
+  veh_wid: 3.0                # vehicle width for pose triangles (metres)
+  fig_size: 4                 # figure width and height in inches
