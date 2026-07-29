@@ -6,7 +6,7 @@ from launch.substitutions import PathJoinSubstitution
 
 def generate_launch_description() -> LaunchDescription:
 	rviz_file = PathJoinSubstitution(
-           [FindPackageShare("dre"), "config", "rviz.rviz"])
+           [FindPackageShare("dre"), "config", "rviz_pogo.rviz"])
 	output_path = PathJoinSubstitution(
 		[FindPackageShare("dre"), "output"]
 	)

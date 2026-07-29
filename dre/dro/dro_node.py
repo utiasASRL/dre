@@ -6,7 +6,7 @@ from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from message_filters import Subscriber, TimeSynchronizer
 from dre.msg import RadarInfo, LocalMapInfo
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 import numpy as np
 import yaml
@@ -49,6 +49,28 @@ class DroNode(Node):
         # view controllers only track TF frames, not topics.
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        # Publish an identity odom->radar transform right away so the "odom" frame
+        # exists in TF from startup, instead of rviz spamming "frame does not exist"
+        # warnings until the first radar+IMU pair actually arrives. Static (not the
+        # regular tf_broadcaster above) because it's a one-shot message: /tf_static
+        # is transient-local, so a late-joining subscriber (e.g. rviz starting up
+        # concurrently) still gets it, unlike a single message on plain /tf.
+        # Kept as self.* (not a local var): the transient-local cached message
+        # only survives as long as the publisher itself does.
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        start_transform = TransformStamped()
+        # Stamp zero (not wall-clock now()): real data replayed from a dataset carries
+        # its own recorded timestamps (e.g. Boreas playback is stamped ~2024), which are
+        # earlier than "now". A "now"-stamped placeholder would make every subsequent
+        # real transform look like it's from the past, and tf2 would reject it as
+        # TF_OLD_DATA. Zero is guaranteed earlier than any real timestamp.
+        start_transform.header.stamp.sec = 0
+        start_transform.header.stamp.nanosec = 0
+        start_transform.header.frame_id = "odom"
+        start_transform.child_frame_id = "radar"
+        start_transform.transform.rotation.w = 1.0
+        self.static_tf_broadcaster.sendTransform(start_transform)
+
         # Get the output path from the parameters
         self.declare_parameter('output_path', 'output')
         self.output_path = self.get_parameter('output_path').get_parameter_value().string_value
@@ -60,6 +82,11 @@ class DroNode(Node):
 
         self.initialized = False
         self.first = True
+
+        # Frame processing stats
+        self.frame_count = 0
+        self.sum_runtime = 0.0
+        self.stats_start_time = None
 
         # Load the config file and populate the DRO options
         config_file_path = "config/config_dro.yaml"
@@ -209,7 +236,18 @@ class DroNode(Node):
         t1 = time.time()
         self.dro.odometryStep(self.radar_data_buffer[0], relevant_imus)
         t2 = time.time()
-        self.get_logger().info(f"DRO odometry step took {round(t2-t1, 3)} seconds")
+
+        if self.frame_count == 0:
+            self.stats_start_time = t1
+        self.frame_count += 1
+        self.sum_runtime += (t2 - t1)
+
+        if self.frame_count % 50 == 0:
+            elapsed = t2 - self.stats_start_time
+            avg_fps = self.frame_count / elapsed if elapsed > 0 else 0.0
+            avg_runtime = self.sum_runtime / self.frame_count
+            self.get_logger().info(
+                f"Frames processed: {self.frame_count} | avg FPS: {avg_fps:.2f} | avg runtime/frame: {avg_runtime:.3f} seconds")
 
 
         # Get the odometry results
