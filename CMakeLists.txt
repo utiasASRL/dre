@@ -5,20 +5,36 @@ if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
 endif()
 
+# Match lgmath's compilation flags to avoid ABI issues
+add_compile_options(-march=native)
+
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED)
+find_package(OpenMP REQUIRED)
 
 find_package(std_msgs REQUIRED)
+find_package(message_filters REQUIRED)
 
-# Build the vendored Dr-BA library (not yet linked by any node in this pass)
+# Build the vendored Dr-BA library
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/dre/ba ba_build)
+
+install(TARGETS ba
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/dre/ba/include/
+  DESTINATION include
+)
 
 install(PROGRAMS
   dre/boreas_player.py
@@ -54,6 +70,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RadarInfo.msg"
   "msg/LocalMapInfo.msg"
   "msg/LoopCandidate.msg"
+  "msg/DRLEstimate.msg"
    DEPENDENCIES std_msgs
 )
 
