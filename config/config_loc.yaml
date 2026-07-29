@@ -28,8 +28,8 @@ initial_pose:
 
 frame_processing:
   max_dist: 80.0           # radius (m) around current pose to query map voxels
-  gauss_blur_sigma: 9.0    # Gaussian blur kernel sigma (pixels) applied to incoming scan
-  gauss_blur_ksize: 11     # Gaussian blur kernel size (must be odd); formula: (int(ceil(3 * sigma)) | 1)
+  gauss_blur_sigma: 3.0    # Gaussian blur kernel sigma (pixels) applied to incoming scan
+  gauss_blur_ksize: 9     # Gaussian blur kernel size (must be odd); formula: (int(ceil(3 * sigma)) | 1)
   adaptive_blur: false     # if true, sigma grows until min_percent_nonzero is met
   min_int_val_tol: 0.5     # pixel threshold for counting a pixel as non-zero
   min_percent_nonzero: 0.3 # target non-zero fraction when adaptive_blur is enabled
