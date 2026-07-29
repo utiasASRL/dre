@@ -1,0 +1,10 @@
+**/__pycache__/
+*.pyc
+
+# CMake build artifacts if built in-tree
+build/
+install/
+log/
+
+# Runtime output written by raplace_node
+raplace_local_maps/

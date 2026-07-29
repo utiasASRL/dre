@@ -6,12 +6,12 @@ from launch.substitutions import PathJoinSubstitution
 
 def generate_launch_description() -> LaunchDescription:
     output_path = PathJoinSubstitution(
-        [FindPackageShare("dr_pogo"), "output"]
+        [FindPackageShare("dre"), "output"]
     )
     return LaunchDescription(
         [
             Node(
-                package="dr_pogo",
+                package="dre",
                 executable="dro_node",
                 name="dro_node",
                 output="screen",

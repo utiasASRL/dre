@@ -1,6 +1,6 @@
 from setuptools import setup
 
-package_name = "dr_pogo"
+package_name = "dre"
 
 setup(
     name=package_name,
@@ -23,10 +23,10 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
-            "boreas_player = dr_pogo.boreas_player:main",
-            "dro_node = dr_pogo.dro_node:main",
-            "raplace_node = dr_pogo.raplace_node:main",
-            "registration_node = dr_pogo.registration_node:main",
+            "boreas_player = dre.boreas_player:main",
+            "dro_node = dre.dro.dro_node:main",
+            "raplace_node = dre.raplace.raplace_node:main",
+            "registration_node = dre.raplace.registration_node:main",
         ],
     },
 )

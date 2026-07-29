@@ -14,8 +14,8 @@ from skimage.transform import radon
 import yaml
 import message_filters
 
-from dr_pogo.msg import LoopCandidate
-from dr_pogo.msg import LocalMapInfo
+from dre.msg import LoopCandidate
+from dre.msg import LocalMapInfo
 
 
 @dataclass
@@ -34,8 +34,8 @@ class RaplaceNode(Node):
         config_file_path = "config/config_raplace.yaml"
         if not os.path.isfile(config_file_path):
             base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            config_file_path = os.path.join(base_path, "share/dr_pogo", config_file_path)
-            self.output_dir = os.path.join(base_path, "share/dr_pogo", "raplace_local_maps")
+            config_file_path = os.path.join(base_path, "share/dre", config_file_path)
+            self.output_dir = os.path.join(base_path, "share/dre", "raplace_local_maps")
         else:
             self.output_dir = "raplace_local_maps"
         with open(config_file_path, "r") as f:

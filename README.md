@@ -71,21 +71,23 @@ The `requirements.txt` covers: `numpy`, `pandas`, `scipy`, `scikit-learn`, `scik
 First clone this repository into your ROS 2 workspace's `src/` directory, then build with:
 ```bash
 cd <your_ros2_workspace>/src
-git clone git@github.com:utiasASRL/dr_pogo.git
+git clone git@github.com:utiasASRL/dre.git
 ```
 
 Then build the workspace with:
 ```bash
 cd <your_ros2_workspace>
-colcon build --packages-select dr_pogo --symlink-install
+colcon build --packages-select dre --symlink-install
 source install/setup.bash
 ```
+
+`--symlink-install` is required: it installs config files as symlinks back to `src/`, so editing a config takes effect immediately without rebuilding.
 
 ## Usage
 
 ### 1. Prepare the config files
 
-Copy the config file `config/config_dro_boreas_rt.yaml` to `config/config_dro.yaml` and edit the parameters as needed.
+`config/config_dro.yaml` ships populated with Boreas RT defaults (also kept as a reference preset under `config/templates/`) — edit it directly, or restore it from the template if needed.
 You can also customize the RaPlace, registration, and pose-graph config files if desired (all parameters should have reasonable defaults though).
 
 Not that by default, the registration node is set to use GPU if available. Depending on your hardware and the size of the local maps, this may slow down the processing of DRO's odometry (both nodes can compete for GPU resources). If you want to disable GPU usage for loop registration, simply set `use_gpu_if_available: false` in the `config/config_registration.yaml` file. It will be slower to compute the loop registration (using only 1 CPU thread), but DRO's behaviour will be more predictable.
@@ -94,10 +96,12 @@ Not that by default, the registration node is set to use GPU if available. Depen
 ### 2. Launch the full pipeline
 
 ```bash
-ros2 launch dr_pogo dr_pogo.launch.py
+ros2 launch dre dr_pogo_launch.py
 ```
 
 This starts all four estimation nodes plus an RViz2 visualizer with the bundled `config/rviz.rviz` preset.
+(`dre_launch.py` is currently identical — it's the forward-looking entry point for the full
+DRE pipeline once mapping/localization nodes are added.)
 
 **Note:** The DRO code will attempt to leverage torch compilation if the `config/config_dro.yaml` file contains the following parameters:
 ```yaml
@@ -114,9 +118,9 @@ If you want to disable compilation, simply remove one of the above parameters fr
 ### 3. Play a Boreas sequence
 
 ```bash
-ros2 run dr_pogo boreas_player -p <path_to_sequence> -r <playback_rate>
+ros2 run dre boreas_player -p <path_to_sequence> -r <playback_rate>
 # Example:
-ros2 run dr_pogo boreas_player -p /data/boreas/boreas-2024-12-03-12-54 -r 1.0
+ros2 run dre boreas_player -p /data/boreas/boreas-2024-12-03-12-54 -r 1.0
 ```
 
 You can also make it play as fast as DRO allows by setting `-r 0` (preventing to wait between messages if your hardware is fast enough to process the data faster than real-time, and allows for slower hardware to keep up by slowing down the playback rate as needed).
@@ -143,7 +147,7 @@ All YAML config files live under `config/`.
 
 ## Output
 
-Atop ROS2 topics shown in RViz, Dr-PoGO outputs the odometry and pose-graph optimized trajectories in files in an output directory specified in the launch file (default is in the install space under `<ros2_ws>/install/dr_pogo/share/dr_pogo/<sequence_id>/`):
+Atop ROS2 topics shown in RViz, Dr-PoGO outputs the odometry and pose-graph optimized trajectories in files in an output directory specified in the launch file (default is in the install space under `<ros2_ws>/install/dre/share/dre/<sequence_id>/`):
 - `odometry_result/<sequence_id>.txt`: DRO odometry trajectory using the Boreas format.
 - `pose_graph_traj.txt`: Pose-graph optimized trajectory in with `timestamp(us) x y theta` format.
 

@@ -7,7 +7,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <yaml-cpp/yaml.h>
-#include <dr_pogo/msg/radar_info.hpp>
+#include <dre/msg/radar_info.hpp>
 
 
 #include <array>
@@ -111,7 +111,7 @@ class PogoNode : public rclcpp::Node {
                 output_traj_path_ += '/';
             }
             RCLCPP_INFO(get_logger(), "Waiting for a single radar info message to initialize the trajectory output file with the sequence ID");
-            dr_pogo::msg::RadarInfo radar_info_msg;
+            dre::msg::RadarInfo radar_info_msg;
             auto node_ptr = std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node *) {});
             if (rclcpp::wait_for_message(
                     radar_info_msg,

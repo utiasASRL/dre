@@ -46,6 +46,11 @@ kDefaultDroOpts = {
         'min_range': 4.0,
         'max_range': 200.0,
     },
+    'solver': {
+        'nb_iter': 250,
+        'cost_tol': 1e-6,
+        'step_tol': 1e-5,
+    },
     'log': {
         'save_local_maps': True,
     },
@@ -309,7 +314,7 @@ class Dro():
         saved_previous_vel = self.previous_vel.clone()
         saved_max_diff_vel = self.max_diff_vel.clone() if isinstance(self.max_diff_vel, torch.Tensor) else self.max_diff_vel
         self.step_counter = 0
-        _ = self.solve(self.state_init.clone(), nb_iter=250, cost_tol=1e-6, step_tol=1e-5)
+        _ = self.solve(self.state_init.clone(), nb_iter=self.opts['solver']['nb_iter'], cost_tol=self.opts['solver']['cost_tol'], step_tol=self.opts['solver']['step_tol'])
         self.step_counter = saved_step_counter
         self.state_init = saved_state_init
         self.previous_vel = saved_previous_vel
@@ -533,7 +538,7 @@ class Dro():
                 self.state_init[:2] = self.state_init[:2]*(1+self.state_init[2]*delta_time)
             if torch.norm(self.state_init[:2]) < 0.75:
                 self.state_init[:] = 0.0
-            result = self.solve(self.state_init, 250, 1e-6, 1e-5)
+            result = self.solve(self.state_init, self.opts['solver']['nb_iter'], self.opts['solver']['cost_tol'], self.opts['solver']['step_tol'])
 
 
             # Check if the the angular velocity is not too high
@@ -548,7 +553,7 @@ class Dro():
             if self.use_doppler and self.estimate_vy_bias and np.linalg.norm(result[:2].cpu().numpy()) > 3.0:
                 save_vy_bias = self.vy_bias
                 self.vy_bias = 0.0
-                vel_doppler_only = self.solve(self.state_init, 100, 1e-6, 1e-4, doppler_only=True)[:2]
+                vel_doppler_only = self.solve(self.state_init, self.opts['solver']['nb_iter'], self.opts['solver']['cost_tol'], self.opts['solver']['step_tol'], doppler_only=True)[:2]
                 self.vy_bias = save_vy_bias
 
                 vel_doppler_only = np.concatenate((vel_doppler_only.cpu().numpy(), [0]))
@@ -1162,7 +1167,7 @@ class Dro():
         with torch.no_grad():
             if not self.use_doppler:
                 raise ValueError("Doppler not used")
-            result = self.solve(self.state_init, 250, 1e-6, 1e-5, doppler_only=True)
+            result = self.solve(self.state_init, self.opts['solver']['nb_iter'], self.opts['solver']['cost_tol'], self.opts['solver']['step_tol'], doppler_only=True)
             return result[:2].detach().cpu().numpy()
 
     # Pull the state estimate

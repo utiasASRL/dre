@@ -5,7 +5,7 @@ from sensor_msgs.msg import Imu
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from message_filters import Subscriber, TimeSynchronizer
-from dr_pogo.msg import RadarInfo, LocalMapInfo
+from dre.msg import RadarInfo, LocalMapInfo
 import numpy as np
 import yaml
 import copy
@@ -28,7 +28,7 @@ class DroNode(Node):
             '/boreas/imu',
             self.imuCallback,
             1000)
-        
+
         # Subscribe synchronously to the image topic and radar info topic
         self.image_subscription = Subscriber(self, Image, '/boreas/radar_image')
         self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
@@ -58,7 +58,7 @@ class DroNode(Node):
         # Load the config file and populate the DRO options
         config_file_path = "config/config_dro.yaml"
         base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        config_file_path = os.path.join(base_path, "share/dr_pogo", config_file_path)
+        config_file_path = os.path.join(base_path, "share/dre", config_file_path)
         print(f"Loading DRO configuration from {config_file_path}")
         with open(config_file_path, 'r') as file:
             config = yaml.safe_load(file)
@@ -110,7 +110,7 @@ class DroNode(Node):
             os.system('rm -r ' + self.odometry_output_path)
         os.makedirs(self.odometry_output_path)
         self.odometry_output_path = os.path.join(self.odometry_output_path, seq_ID + '.txt')
-        
+
         # If saving local maps, create the folders
         if self.dro_opts['log']['save_local_maps']:
             self.local_map_output_path = os.path.join(self.seq_output_folder, "local_maps")
@@ -189,7 +189,7 @@ class DroNode(Node):
         last_radar_time = self.radar_data_buffer[0]['timestamps'][-1] + 2000  # Add 2ms to ensure we cover the radar timestamps
         if self.imu_data_buffer[0]['timestamp'] > first_radar_time or self.imu_data_buffer[-1]['timestamp'] < last_radar_time:
             return
-        
+
         # Get the minimum number of IMU measurements that cover the radar timestamps
         imu_times = np.array([imu['timestamp'] for imu in self.imu_data_buffer])
         start_idx = np.searchsorted(imu_times, first_radar_time, side='left')
@@ -272,7 +272,7 @@ class DroNode(Node):
         else:
             df_odom.to_csv(self.odometry_3d_output_path, mode='a', header=None, index=None, sep=' ')
 
-        
+
     # Input local map needs to be in [0, 255] uint8 format np array
     def publishLocalMap(self, local_map, xy_theta, timestamp):
         if local_map.dtype != np.uint8:

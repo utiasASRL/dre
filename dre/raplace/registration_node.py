@@ -16,7 +16,7 @@ import torch
 import time
 from scipy.spatial.transform import Rotation as R
 
-from dr_pogo.msg import LoopCandidate
+from dre.msg import LoopCandidate
 
 
 @dataclass
@@ -372,7 +372,7 @@ class RegistrationNode(Node):
         self.package_share = ""
         if not os.path.isfile(config_file_path):
             base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            self.package_share = os.path.join(base_path, "share", "dr_pogo")
+            self.package_share = os.path.join(base_path, "share", "dre")
             config_file_path = os.path.join(self.package_share, config_file_path)
         with open(config_file_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)

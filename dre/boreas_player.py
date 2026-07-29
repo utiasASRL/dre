@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, Image
 from nav_msgs.msg import Odometry
-from dr_pogo.msg import RadarInfo
+from dre.msg import RadarInfo
 from cv_bridge import CvBridge
 import cv2
 import numpy as np

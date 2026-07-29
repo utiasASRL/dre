@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(dr_pogo)
+project(dre)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
@@ -17,33 +17,36 @@ find_package(Eigen3 REQUIRED)
 
 find_package(std_msgs REQUIRED)
 
+# Build the vendored Dr-BA library (not yet linked by any node in this pass)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/dre/ba ba_build)
+
 install(PROGRAMS
-  dr_pogo/boreas_player.py
+  dre/boreas_player.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME boreas_player
 )
 
 install(PROGRAMS
-  dr_pogo/dro_node.py
+  dre/dro/dro_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME dro_node
 )
 
 install(PROGRAMS
-  dr_pogo/raplace_node.py
+  dre/raplace/raplace_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME raplace_node
 )
 
 install(PROGRAMS
-  dr_pogo/registration_node.py
+  dre/raplace/registration_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME registration_node
 )
 
 install(FILES
-  dr_pogo/dro.py
-  dr_pogo/dro_motion_models.py
+  dre/dro/dro.py
+  dre/dro/dro_motion_models.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -69,10 +72,10 @@ install(DIRECTORY config
 )
 
 add_executable(pogo_node
-  dr_pogo/pogo/pogo_node.cpp dr_pogo/pogo/pose_graph.cpp
+  dre/pogo/pogo_node.cpp dre/pogo/pose_graph.cpp
 )
 target_include_directories(pogo_node PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/dr_pogo/pogo
+  ${CMAKE_CURRENT_SOURCE_DIR}/dre/pogo
   ${YAML_CPP_INCLUDE_DIRS}
   ${CERES_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
