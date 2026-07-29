@@ -1,22 +1,23 @@
 #include "pose_graph.h"
-#include <iostream>
+#include <rclcpp/rclcpp.hpp>
 #include <cmath>
 #include <stdexcept>
 
-
+namespace {
+rclcpp::Logger poseGraphLogger() {
+    return rclcpp::get_logger("pose_graph");
+}
+}  // namespace
 
 
 PoseGraph::PoseGraph(const PoseGraphOpts& opts)
     : opts_(opts)
 {
-    std::cout << "PoseGraph initialized with "
-              << "\n\tloss_scale_loop_pos_coarse: " << opts.loss_scale_loop_pos_coarse << " m, "
-              << "\n\tloss_scale_loop_pos_fine: " << opts.loss_scale_loop_pos_fine << " m, "
-              << "\n\tloss_scale_loop_rot: " << opts.loss_scale_loop_rot << " rad, "
-              << "\n\tstd_odom_pos: " << opts.odom_pos_std << " m, "
-              << "\n\tstd_odom_rot: " << opts.odom_rot_std << " rad, "
-              << "\n\tstd_loop_pos: " << opts.loop_pos_std << " m, "
-              << "\n\tstd_loop_rot: " << opts.loop_rot_std << " rad" << std::endl;
+    RCLCPP_INFO(poseGraphLogger(),
+                "PoseGraph initialized with loss_scale_loop_pos(coarse=%.2f m, fine=%.2f m, rot=%.4f rad), "
+                "std(odom_pos=%.4f m, odom_rot=%.6f rad, loop_pos=%.3f m, loop_rot=%.4f rad)",
+                opts.loss_scale_loop_pos_coarse, opts.loss_scale_loop_pos_fine, opts.loss_scale_loop_rot,
+                opts.odom_pos_std, opts.odom_rot_std, opts.loop_pos_std, opts.loop_rot_std);
 
     // Initialize loss functions
     loss_function_loop_pos_ = new DynamicCauchyLoss(opts.loss_scale_loop_pos_coarse / opts.loop_pos_std);
@@ -100,11 +101,11 @@ void PoseGraph::addLoopClosureRotEdge(const int64_t t0, const int64_t t1, std::a
         if(it != node_indices_.end() && std::abs(it->first - t0) <= 5000)
         {
             local_t0 = it->first;
-            std::cout << "Using closest timestamp " << local_t0 << " for loop closure edge t0 instead of " << t0 << std::endl;
+            RCLCPP_DEBUG(poseGraphLogger(), "Using closest timestamp %ld for loop closure edge t0 instead of %ld", local_t0, t0);
         }
         else
         {
-            std::cout << "No close timestamp found for loop closure edge t0 " << t0 << ", skipping this edge." << std::endl;
+            RCLCPP_WARN(poseGraphLogger(), "No close timestamp found for loop closure edge t0 %ld, skipping this edge.", t0);
             return;
         }
     }
@@ -115,11 +116,11 @@ void PoseGraph::addLoopClosureRotEdge(const int64_t t0, const int64_t t1, std::a
         if(it != node_indices_.end() && std::abs(it->first - t1) <= 5000)
         {
             local_t1 = it->first;
-            std::cout << "Using closest timestamp " << local_t1 << " for loop closure edge t1 instead of " << t1 << std::endl;
+            RCLCPP_DEBUG(poseGraphLogger(), "Using closest timestamp %ld for loop closure edge t1 instead of %ld", local_t1, t1);
         }
         else
         {
-            std::cout << "No close timestamp found for loop closure edge t1 " << t1 << ", skipping this edge." << std::endl;
+            RCLCPP_WARN(poseGraphLogger(), "No close timestamp found for loop closure edge t1 %ld, skipping this edge.", t1);
             return;
         }
     }
@@ -148,11 +149,11 @@ void PoseGraph::addLoopClosurePosEdge(const int64_t t0, const int64_t t1, std::a
         if(it != node_indices_.end() && std::abs(it->first - t0) <= 5000)
         {
             local_t0 = it->first;
-            std::cout << "Using closest timestamp " << local_t0 << " for loop closure edge t0 instead of " << t0 << std::endl;
+            RCLCPP_DEBUG(poseGraphLogger(), "Using closest timestamp %ld for loop closure edge t0 instead of %ld", local_t0, t0);
         }
         else
         {
-            std::cout << "No close timestamp found for loop closure edge t0 " << t0 << ", skipping this edge." << std::endl;
+            RCLCPP_WARN(poseGraphLogger(), "No close timestamp found for loop closure edge t0 %ld, skipping this edge.", t0);
             return;
         }
     }
@@ -163,11 +164,11 @@ void PoseGraph::addLoopClosurePosEdge(const int64_t t0, const int64_t t1, std::a
         if(it != node_indices_.end() && std::abs(it->first - t1) <= 5000)
         {
             local_t1 = it->first;
-            std::cout << "Using closest timestamp " << local_t1 << " for loop closure edge t1 instead of " << t1 << std::endl;
+            RCLCPP_DEBUG(poseGraphLogger(), "Using closest timestamp %ld for loop closure edge t1 instead of %ld", local_t1, t1);
         }
         else
         {
-            std::cout << "No close timestamp found for loop closure edge t1 " << t1 << ", skipping this edge." << std::endl;
+            RCLCPP_WARN(poseGraphLogger(), "No close timestamp found for loop closure edge t1 %ld, skipping this edge.", t1);
             return;
         }
     }
@@ -214,14 +215,17 @@ void PoseGraph::optimize()
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem_, &summary);
-    std::cout << summary.BriefReport() << std::endl;
+    // Full solver report is noisy on every loop closure; keep it at DEBUG
+    // level (enable with --ros-args --log-level pose_graph:=debug) and let
+    // printLastPose() give the routine one-line confirmation instead.
+    RCLCPP_DEBUG(poseGraphLogger(), "%s", summary.BriefReport().c_str());
 
     // Update the loss functions with the final scale
     if ((loss_function_loop_pos_) && (first_optimization_)) {
         first_optimization_ = false;
         dynamic_cast<DynamicCauchyLoss*>(loss_function_loop_pos_)->setScale(opts_.loss_scale_loop_pos_fine / opts_.loop_pos_std);
         ceres::Solve(options, &problem_, &summary);
-        std::cout << summary.BriefReport() << std::endl;
+        RCLCPP_DEBUG(poseGraphLogger(), "%s", summary.BriefReport().c_str());
     }
 
 }
@@ -232,8 +236,8 @@ void PoseGraph::printPoses() const
     for(size_t i = 0; i < node_times_.size(); ++i)
     {
         const auto& pose = *(node_poses_[i]);
-        std::cout << node_times_[i] << " -> ("
-                    << pose[0] << ", " << pose[1] << ", " << pose[2] << " rad)" << std::endl;
+        RCLCPP_DEBUG(poseGraphLogger(), "%ld -> (%f, %f, %f rad)",
+                     node_times_[i], pose[0], pose[1], pose[2]);
     }
 }
 
@@ -241,12 +245,12 @@ void PoseGraph::printLastPose() const
 {
     if(node_poses_.empty())
     {
-        std::cout << "No poses available." << std::endl;
+        RCLCPP_WARN(poseGraphLogger(), "No poses available.");
         return;
     }
     const auto& pose = *(node_poses_.back());
-    std::cout << "Last pose: "
-                << pose[0] << ", " << pose[1] << ", " << pose[2] << " rad" << std::endl;
+    RCLCPP_INFO(poseGraphLogger(), "Loop closure optimized. Last pose: x=%.2f, y=%.2f, theta=%.3f rad",
+                pose[0], pose[1], pose[2]);
 }
 
 

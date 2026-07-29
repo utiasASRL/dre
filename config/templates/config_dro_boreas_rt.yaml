@@ -37,13 +37,8 @@ gp:
   lengthscale_range: 4.0
   sz: 0.6
 log:
-  display: false
-  save_images: false
   save_local_maps: false
   save_cumulative_image: false
-  verbose: true
-  save_scans: false
-  max_scan_range: 120.0
 radar:
   beta_corr_fact: 0.944
   del_f: 893.0E6

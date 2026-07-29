@@ -95,7 +95,6 @@ private:
         YAML::Node config = YAML::LoadFile(full_config_path);
 
         map_path_ = config["map_path"].as<std::string>();
-        voxel_map_res_ = config["voxel_map_resolution"].as<double>();
         num_threads_ = config["num_threads"].as<int>();
 
         max_dist_ = config["frame_processing"]["max_dist"].as<double>();
@@ -158,7 +157,10 @@ private:
             first_frame_ = false;
         }
 
-        ba::LocalMapScan scan(0, 0, voxel_map_res_, opts, init_pose.toSE3(), init_pose.toSE3(), local_map);
+        // Scan resolution comes from the live message (set by dro_node from its own
+        // config), not a separately-configured value here: this is what the DRO
+        // local map actually was published at, so it can never drift out of sync.
+        ba::LocalMapScan scan(0, 0, info_msg->resolution, opts, init_pose.toSE3(), init_pose.toSE3(), local_map);
 
         // Optimization loop
         double cost = 0.0;
@@ -291,7 +293,6 @@ private:
 
     // Config parameters
     std::string map_path_;
-    double voxel_map_res_;
     int num_threads_;
     double max_dist_;
     double gauss_blur_sigma_;

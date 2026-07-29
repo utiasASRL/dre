@@ -98,7 +98,7 @@ class DroNode(Node):
         config_file_path = "config/config_dro.yaml"
         base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         config_file_path = os.path.join(base_path, "share/dre", config_file_path)
-        print(f"Loading DRO configuration from {config_file_path}")
+        self.get_logger().info(f"Loading DRO configuration from {config_file_path}")
         with open(config_file_path, 'r') as file:
             config = yaml.safe_load(file)
         dro_opts = copy.deepcopy(kDefaultDroOpts)
@@ -140,7 +140,7 @@ class DroNode(Node):
         # Create the output folders for the sequence
         seq_ID = radar_data['sequence_id']
         self.seq_output_folder = os.path.join(self.output_path, seq_ID)
-        print(f"Creating output folder: {self.seq_output_folder}")
+        self.get_logger().info(f"Creating output folder: {self.seq_output_folder}")
         os.makedirs(self.seq_output_folder, exist_ok=True)
 
         # Create the odometry output file
@@ -278,7 +278,7 @@ class DroNode(Node):
             avg_fps = self.frame_count / elapsed if elapsed > 0 else 0.0
             avg_runtime = self.sum_runtime / self.frame_count
             self.get_logger().info(
-                f"Frames processed: {self.frame_count} | avg FPS: {avg_fps:.2f} | avg runtime/frame: {avg_runtime:.3f} seconds")
+                f"Frames processed: {self.frame_count} | avg FPS: {avg_fps:.2f} | avg runtime/frame: {avg_runtime * 1000:.1f} ms")
 
 
         # Get the odometry results

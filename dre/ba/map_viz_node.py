@@ -72,6 +72,17 @@ class MapVizNode(Node):
         self._bg = None
         self._last_dot_xy = (None, None)
 
+        # Lifetime timing sums for the periodic (every kReportInterval reloads)
+        # INFO summary; per-reload detail goes to DEBUG instead (enable with
+        # --ros-args --log-level map_viz_node:=debug) so normal operation isn't
+        # spammed with one reload every time the map changes.
+        self._report_interval = 50
+        self._reload_count = 0
+        self._report_load_sum = 0.0
+        self._report_raster_sum = 0.0
+        self._report_render_sum = 0.0
+        self._report_total_sum = 0.0
+
         self.est_sub_ = self.create_subscription(
             DRLEstimate, "/drl_estimate", self._estimate_callback, 10)
         # Depth 1: reloads can take longer than the save period, and only the
@@ -89,7 +100,7 @@ class MapVizNode(Node):
 
     def _map_path_callback(self, msg: String):
         map_path = msg.data
-        self.get_logger().info(f"Loading voxel map: {map_path}")
+        self.get_logger().debug(f"Loading voxel map: {map_path}")
 
         # Build the new figure on local variables only; self._fig/_ax/_dot/_bg
         # are not touched until everything below succeeds, so a malformed or
@@ -102,7 +113,7 @@ class MapVizNode(Node):
             if len(voxels) == 0:
                 raise ValueError("voxel map has no voxels")
             t_load = time.perf_counter() - t0
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"Loaded {len(voxels)} voxels, res={res:.3f} m, {len(poses)} poses"
             )
 
@@ -181,15 +192,32 @@ class MapVizNode(Node):
             plt.close(self._fig)
         self._fig, self._ax, self._dot, self._bg = new_fig, ax, new_dot, new_bg
 
-        self.get_logger().info(
+        total = time.perf_counter() - t0
+        self.get_logger().debug(
             f"Map ready: extent x=[{extent[0]:.0f}, {extent[1]:.0f}] m  "
             f"y=[{extent[2]:.0f}, {extent[3]:.0f}] m"
         )
-        self.get_logger().info(
-            f"[timing] map viz reload: load {t_load:.2f} s ({len(voxels)} voxels), "
-            f"rasterize {t_raster:.2f} s, render {t_render:.2f} s, "
-            f"total {time.perf_counter() - t0:.2f} s (frame publishing blocked throughout)"
+        self.get_logger().debug(
+            f"[timing] map viz reload: load {t_load * 1000:.1f} ms ({len(voxels)} voxels), "
+            f"rasterize {t_raster * 1000:.1f} ms, render {t_render * 1000:.1f} ms, "
+            f"total {total * 1000:.1f} ms (frame publishing blocked throughout)"
         )
+
+        self._reload_count += 1
+        self._report_load_sum += t_load
+        self._report_raster_sum += t_raster
+        self._report_render_sum += t_render
+        self._report_total_sum += total
+        if self._reload_count % self._report_interval == 0:
+            n = self._reload_count
+            self.get_logger().info(
+                f"[timing] avg over {n} reloads: load {self._report_load_sum / n * 1000:.1f} ms, "
+                f"rasterize {self._report_raster_sum / n * 1000:.1f} ms, "
+                f"render {self._report_render_sum / n * 1000:.1f} ms, "
+                f"total {self._report_total_sum / n * 1000:.1f} ms | "
+                f"{len(voxels)} voxels, extent x=[{extent[0]:.0f}, {extent[1]:.0f}] m "
+                f"y=[{extent[2]:.0f}, {extent[3]:.0f}] m"
+            )
 
     def _estimate_callback(self, msg: DRLEstimate):
         # Just update dot position — rendering is driven by the timer

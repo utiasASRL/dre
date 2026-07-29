@@ -279,7 +279,7 @@ private:
 
         T_kf_prev_ = odom_pose;
         have_prev_kf_ = true;
-        RCLCPP_INFO(get_logger(), "keyframe %d queued (stamp %ld)", next_scan_id_, timestamp_us);
+        RCLCPP_DEBUG(get_logger(), "keyframe %d queued (stamp %ld)", next_scan_id_, timestamp_us);
         ++next_scan_id_;
         notifyWorker();
     }
@@ -525,7 +525,7 @@ private:
         // below), so intake never blocks on I/O either direction.
         std::vector<std::pair<std::shared_ptr<ba::LocalMapScan>, std::chrono::steady_clock::time_point>> new_scans;
         new_scans.reserve(new_pending.size());
-        double write_sec = 0.0;
+        double write_ms = 0.0;
         for (const auto& p : new_pending) {
             std::string filename = std::to_string(p.timestamp_us) + ".png";
             fs::path img_path = local_maps_dir_ / filename;
@@ -536,7 +536,7 @@ private:
                             p.timestamp_us);
                 continue;
             }
-            write_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_write0).count();
+            write_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_write0).count();
 
             auto scan = std::make_shared<ba::LocalMapScan>(
                 p.timestamp_us,
@@ -568,13 +568,13 @@ private:
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        double alloc_sec = std::chrono::duration<double>(t0 - t_start).count();
+        double alloc_ms = std::chrono::duration<double, std::milli>(t0 - t_start).count();
 
         // How long the oldest queued keyframe waited for this timer tick
-        double max_queue_wait_sec = 0.0;
+        double max_queue_wait_ms = 0.0;
         for (const auto& [scan, arrival] : new_scans) {
-            max_queue_wait_sec = std::max(max_queue_wait_sec,
-                std::chrono::duration<double>(t0 - arrival).count());
+            max_queue_wait_ms = std::max(max_queue_wait_ms,
+                std::chrono::duration<double, std::milli>(t0 - arrival).count());
         }
 
         // Integrate new scans first so a large moved backlog (loop closure)
@@ -622,6 +622,16 @@ private:
         }
         auto t_moved_done = std::chrono::steady_clock::now();
 
+        // A loop closure can leave more moved scans than fit in one cycle (see
+        // the comment above); surface that a backlog is being worked through,
+        // throttled so a multi-cycle correction doesn't spam once per cycle.
+        if (moved_processed < moved_total) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                        "Re-integrating loop closure backlog: %zu/%zu scans this cycle, "
+                        "%zu still pending (re-detected next cycle)",
+                        moved_processed, moved.size(), moved_total - moved_processed);
+        }
+
         enforceLoadedScanLimit();
 
         // Rebuild the voxel map's stored poses (init_map appends one entry per
@@ -638,16 +648,40 @@ private:
 
         changed_since_save_ = true;
 
-        double new_sec = std::chrono::duration<double>(t_new_done - t0).count();
-        double moved_sec = std::chrono::duration<double>(t_moved_done - t_new_done).count();
+        double new_ms = std::chrono::duration<double, std::milli>(t_new_done - t0).count();
+        double moved_ms = std::chrono::duration<double, std::milli>(t_moved_done - t_new_done).count();
 
-        RCLCPP_INFO(get_logger(),
-                    "[timing] integrate: queue wait %.1f s (max) | write %.2f s | allocate %.2f s | "
-                    "integrate %zu new %.2f s | re-integrate %zu/%zu moved %.2f s | %d scans, %zu voxels",
-                    max_queue_wait_sec, write_sec, alloc_sec,
-                    new_scans.size(), new_sec,
-                    moved_processed, moved_total, moved_sec,
+        RCLCPP_DEBUG(get_logger(),
+                    "[timing] integrate: queue wait %.1f ms (max) | write %.1f ms | allocate %.1f ms | "
+                    "integrate %zu new %.1f ms | re-integrate %zu/%zu moved %.1f ms | %d scans, %zu voxels",
+                    max_queue_wait_ms, write_ms, alloc_ms,
+                    new_scans.size(), new_ms,
+                    moved_processed, moved_total, moved_ms,
                     scan_manager_.num_scans(), voxel_map_->size());
+
+        // Lifetime-average summary at INFO, every kReportInterval cycles; full
+        // per-cycle detail above stays at DEBUG (enable with --ros-args
+        // --log-level mapping_node:=debug) so normal operation isn't spammed.
+        ++report_cycle_count_;
+        report_queue_wait_sum_ += max_queue_wait_ms;
+        report_write_sum_ += write_ms;
+        report_alloc_sum_ += alloc_ms;
+        report_new_sum_ += new_ms;
+        report_moved_sum_ += moved_ms;
+        if (report_cycle_count_ % kReportInterval == 0) {
+            RCLCPP_INFO(get_logger(),
+                        "[timing] avg over %d cycles: queue wait %.1f ms | write %.1f ms | allocate %.1f ms | "
+                        "integrate %.1f ms | re-integrate %.1f ms | save %.1f ms (%d saves) | %d scans, %zu voxels",
+                        report_cycle_count_,
+                        report_queue_wait_sum_ / report_cycle_count_,
+                        report_write_sum_ / report_cycle_count_,
+                        report_alloc_sum_ / report_cycle_count_,
+                        report_new_sum_ / report_cycle_count_,
+                        report_moved_sum_ / report_cycle_count_,
+                        report_save_count_ > 0 ? report_save_sum_ / report_save_count_ : 0.0,
+                        report_save_count_,
+                        scan_manager_.num_scans(), voxel_map_->size());
+        }
     }
 
     // Save and publish the map at most once per map_update_period_sec
@@ -661,7 +695,7 @@ private:
         }
 
         voxel_map_->save_to_file(map_file_path_, scan_manager_);
-        double save_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - now).count();
+        double save_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
         last_save_ = std::chrono::steady_clock::now();
         changed_since_save_ = false;
 
@@ -669,8 +703,12 @@ private:
         msg.data = map_file_path_;
         map_path_pub_->publish(msg);
 
-        RCLCPP_INFO(get_logger(), "[timing] map saved and published in %.2f s (%zu voxels)",
-                    save_sec, voxel_map_->size());
+        RCLCPP_DEBUG(get_logger(), "[timing] map saved and published in %.1f ms (%zu voxels)",
+                     save_ms, voxel_map_->size());
+
+        // Rolled into the periodic summary logged from integrateOnce().
+        ++report_save_count_;
+        report_save_sum_ += save_ms;
     }
 
     // Config
@@ -687,6 +725,18 @@ private:
     // Accumulated weights below this are float residue from scan removals
     static constexpr double kMinAccumWeight = 1e-6;
     ba::OptimizationOptions opt_opts_;
+
+    // Lifetime timing sums for the periodic (every kReportInterval cycles) INFO
+    // summary; worker thread only, see integrateOnce()/maybeSaveMap().
+    static constexpr int kReportInterval = 50;
+    int report_cycle_count_ = 0;
+    double report_queue_wait_sum_ = 0.0;
+    double report_write_sum_ = 0.0;
+    double report_alloc_sum_ = 0.0;
+    double report_new_sum_ = 0.0;
+    double report_moved_sum_ = 0.0;
+    int report_save_count_ = 0;
+    double report_save_sum_ = 0.0;
 
     // Keyframe image storage
     fs::path local_maps_dir_;

@@ -179,7 +179,7 @@ class LocalMapRegistrator:
 
 
     #@torch.compile
-    def register(self, nb_iter=20, cost_tol=1e-6, step_tol=1e-6, verbose=False):
+    def register(self, nb_iter=20, cost_tol=1e-6, step_tol=1e-6):
         with torch.no_grad():
             # The gradient ascent keep track of the last increasing state and gradient
             # Thus, if the cost function decreases, we go back to the last increasing
@@ -228,10 +228,6 @@ class LocalMapRegistrator:
 
                 if i == 0:
                     first_cost = cost
-                
-                # Print iter cost step_norm cost_change with 3 decimals and scientific notation
-                if verbose:
-                    print("Iter: ", i, " - Cost: ", "{:.3e}".format(cost), " - Step norm: ", "{:.3e}".format(step_norm), " - Cost change: ", "{:.3e}".format(cost_change))
 
                 if step_norm < step_tol:
                     break
@@ -448,17 +444,20 @@ class RegistrationNode(Node):
             t1 = time.time()
             result = self.refineRegistration(candidate_img, query_img, float(msg.resolution), result)
             t2 = time.time()
-            self.get_logger().info(
-                f"Refinement for candidate q={msg.query_index} c={msg.candidate_index} took {t2-t1:.2f} seconds. Final reason: {result.reason}."
+            self.get_logger().debug(
+                f"Refinement for candidate q={msg.query_index} c={msg.candidate_index} took {(t2-t1) * 1000:.1f} ms. Final reason: {result.reason}."
             )
 
         if result.valid:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"Candidate q={msg.query_index} c={msg.candidate_index} registered successfully: "
                 f"pose={poseToxytheta(result.pose)}, scale={result.scale:.3f}, matches={result.num_matches}, reason={result.reason}."
             )
         else:
-            self.get_logger().info(
+            # Most candidates fail this way (a routine "not a match", not a
+            # problem) — DEBUG only; publishResult()'s "accepted" line at INFO
+            # is the one that actually means a loop closure was found.
+            self.get_logger().debug(
                 f"Candidate q={msg.query_index} c={msg.candidate_index} registration failed: "
                 f"scale={result.scale:.3f}, matches={result.num_matches}, reason={result.reason}."
             )
@@ -556,7 +555,7 @@ class RegistrationNode(Node):
     
     def refineRegistration(self, img_i, img_j, res, reg_result):
             if img_i is None or img_j is None:
-                print(f"Skipping registration due to missing images.")
+                self.get_logger().warn("Skipping registration due to missing images.")
                 return
             img_i = cv2.GaussianBlur(img_i, (5, 5), 0)
             img_j = cv2.GaussianBlur(img_j, (5, 5), 0)
@@ -573,7 +572,7 @@ class RegistrationNode(Node):
             local_map_registrator = LocalMapRegistrator(img_j_small, img_i_small, res_small, poseToxytheta(reg_result.pose), use_gpu_if_available=self.use_gpu_if_available)
             local_map_registrator.gridSearchInitialization([[-2,2],[-2,2], [np.radians(-1.0), np.radians(1.0)]], nb_steps=3)
 
-            state = local_map_registrator.register(nb_iter=20, verbose=False, step_tol=1e-4)
+            state = local_map_registrator.register(nb_iter=20, step_tol=1e-4)
 
             # Resize the images
             img_i_small = cv2.resize(img_i, (img_i.shape[1]//2 + 1, img_i.shape[0]//2 + 1))
@@ -583,7 +582,7 @@ class RegistrationNode(Node):
             img_i_small = cv2.GaussianBlur(img_i_small, (5, 5), 0)
             img_j_small = cv2.GaussianBlur(img_j_small, (5, 5), 0)
             local_map_registrator = LocalMapRegistrator(img_j_small, img_i_small, res_small, state, use_gpu_if_available=self.use_gpu_if_available)
-            state = local_map_registrator.register(nb_iter=40, verbose=False, step_tol=1e-4)
+            state = local_map_registrator.register(nb_iter=40, step_tol=1e-4)
             x, y, theta = state
 
             reg_score = local_map_registrator.getRegistrationScore()
@@ -655,7 +654,7 @@ class RegistrationNode(Node):
                 f"matches={result.num_matches}, scale={result.scale:.3f}"
             )
         else:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"Registration rejected q={source_msg.query_index} c={source_msg.candidate_index}: "
                 f"reason={result.reason}, matches={result.num_matches}, scale={result.scale:.3f}"
             )

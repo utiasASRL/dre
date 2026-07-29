@@ -159,7 +159,7 @@ class Dro():
                 import torch._logging as torch_logging
                 torch_logging.set_logs(recompiles=True, guards=True, dynamic=True)
             except Exception:
-                print("DRO_COMPILE_DEBUG enabled but torch._logging.set_logs is unavailable")
+                self.node.get_logger().warn("DRO_COMPILE_DEBUG enabled but torch._logging.set_logs is unavailable")
 
         self.getUpDownPolarImages = torch.compile(self.getUpDownPolarImages, dynamic=True)
         self.prepareLocalMapPolarCoords = torch.compile(self.prepareLocalMapPolarCoords, dynamic=True)
@@ -1040,7 +1040,7 @@ class Dro():
 
 
     # Gradient ascent solver for the state estimation
-    def solve(self, state_init, nb_iter=20, cost_tol=1e-6, step_tol=1e-6, verbose=False, degraded=False, doppler_only=False):
+    def solve(self, state_init, nb_iter=20, cost_tol=1e-6, step_tol=1e-6, degraded=False, doppler_only=False):
         with torch.no_grad():
             # As there is no local map yet at the first scan, we remove the angular velocity
             # from the state (if any)
@@ -1107,10 +1107,6 @@ class Dro():
 
                 if i == 0:
                     first_cost = cost
-                
-                # Print iter cost step_norm cost_change with 3 decimals and scientific notation
-                if verbose:
-                    print("Iter: ", i, " - Cost: ", "{:.3e}".format(cost), " - Step norm: ", "{:.3e}".format(step_norm), " - Cost change: ", "{:.3e}".format(cost_change))
 
                 if step_norm < step_tol:
                     break
@@ -1125,7 +1121,7 @@ class Dro():
             try_degraded = try_degraded or (torch.abs(torch.norm(vel[-1,:]) - self.previous_vel) > self.max_diff_vel)
             if try_degraded:
                 if not degraded:
-                    state = self.solve(state_init, nb_iter=nb_iter, cost_tol=cost_tol, step_tol=step_tol, verbose=verbose, degraded=True)
+                    state = self.solve(state_init, nb_iter=nb_iter, cost_tol=cost_tol, step_tol=step_tol, degraded=True)
 
             if not degraded:
                 vel, _, _ = self.motion_model.getVelPosRot(state, with_jac=False)
