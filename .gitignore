@@ -8,3 +8,6 @@ log/
 
 # Runtime output written by raplace_node
 raplace_local_maps/
+
+# Runtime output written by dro_node/pogo_node/mapping_node (via mode_node)
+output/
