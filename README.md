@@ -44,11 +44,20 @@ The loop-closure detection module is directly adapted from RaPlace's original co
 
 ## Architecture overview
 
+`mode_node` (Python) is the process manager `mode_launch.py` starts: given a `mode` (see [Launch a pipeline](#2-launch-a-pipeline)), it launches exactly the nodes below that mode needs as raw subprocesses (so it fully owns their lifecycle), and republishes the active mode on `/operational_mode` so long-lived nodes can tell what's going on around them.
+
+### Data source (optional)
+
+Not started by `mode_launch.py` — run manually alongside a pipeline, or replaced entirely by your own live data (see [Feed it data](#3-feed-it-data-playback-or-live)).
+
+| Node | Language | Role |
+|------|----------|------|
+| `boreas_player` | Python | Replays a Boreas sequence as the three input topics (`/boreas/radar_image`, `/boreas/radar_info`, `/boreas/imu`) |
+
 ### Dr-PoGO pipeline (odometry, loop closure, pose graph)
 
 | Node | Language | Role |
 |------|----------|------|
-| `boreas_player` | Python | Replays a Boreas sequence (radar + IMU) as ROS 2 topics |
 | `dro_node` | Python | Doppler-aware direct radar odometry |
 | `raplace_node` | Python | Loop-closure detection using RaPlace |
 | `registration_node` | Python | Feature-based registration and direct refinement of loop-closure transformations |
@@ -129,20 +138,32 @@ Note that by default, the registration node is set to use GPU if available. Depe
 
 ### 2. Launch a pipeline
 
-Several launch files are provided depending on which stages you need:
-
-| Launch file | Nodes started | Use case |
-|-------------|---------------|----------|
-| `dro_launch.py` | `dro_node` + RViz | Odometry only |
-| `dr_pogo_launch.py` | `dro_node`, `raplace_node`, `registration_node`, `pogo_node` + RViz | Original Dr-PoGO pipeline (odometry + loop closure + pose graph, no mapping) |
-| `mapping_launch.py` / `dre_launch.py` | All of the above plus `mapping_node`, `map_viz_node` | Full online pipeline: odometry, loop closure, pose graph, and live voxel-map building. Currently identical; `dre_launch.py` is the forward-looking name |
-| `drl_launch.py` | `dro_node`, `loc_node`, `initial_pose_selector`, `loc_viz_node`, `map_viz_node` + RViz | Localize live DRO output against a voxel map built in a previous run |
+`mode_launch.py` is the single entry point: it starts a `mode_node`, which itself launches (and, on a later re-launch with a different `mode`, restarts) whichever set of nodes the requested `mode` needs, plus a matching RViz preset.
 
 ```bash
-ros2 launch dre dre_launch.py
+ros2 launch dre mode_launch.py mode:=mapping
 ```
 
-This starts the full estimation pipeline plus an RViz2 visualizer with the bundled `config/rviz_mapping.rviz` preset (each launch file uses its own matching RViz preset).
+| Argument | Default | Description |
+|----------|---------|--------------|
+| `mode` | `dro` | Which pipeline to run: `dro`, `pogo`, `mapping`, or `localization` (see `mode_node.py`'s `MODE_TABLE`) |
+| `headless` | `false` | If `true`, skip RViz for the chosen mode |
+
+| Mode | Nodes started | Use case |
+|------|---------------|----------|
+| `dro` | `dro_node` + RViz | Odometry only |
+| `pogo` | `dro_node`, `raplace_node`, `registration_node`, `pogo_node` + RViz | Dr-PoGO pipeline (odometry + loop closure + pose graph, no mapping) |
+| `mapping` | All of the above plus `mapping_node`, `map_viz_node` | Full online pipeline: odometry, loop closure, pose graph, and live voxel-map building |
+| `localization` | `dro_node`, `raplace_node`, `registration_node`, `loc_node`, `initial_pose_selector`, `loc_viz_node`, `map_viz_node` + RViz | Localize live DRO output against a voxel map built in a previous run (DRL) |
+
+`mode_node` also publishes the active mode (latched) on `/operational_mode`, which nodes that behave differently per mode (e.g. `raplace_node`, querying vs. inserting into its history) read to know what's going on around them.
+
+<details>
+<summary>Legacy per-pipeline launch files (superseded by <code>mode_launch.py</code>)</summary>
+
+`dro_launch.py`, `dr_pogo_launch.py`, `mapping_launch.py`, `dre_launch.py`, and `drl_launch.py` still exist and work, but each only covers one fixed pipeline (`dre_launch.py` and `mapping_launch.py` are identical to each other, and to `mode_launch.py mode:=mapping`; the others map to `mode_launch.py mode:=dro/pogo/localization` respectively). Prefer `mode_launch.py` going forward.
+
+</details>
 
 **Note:** The DRO code will attempt to leverage torch compilation if the `config/config_dro.yaml` file contains the following parameters:
 ```yaml
@@ -156,21 +177,31 @@ If you chose to enable compilation, the initialization of the `dro_node` will ta
 ```
 If you want to disable compilation, simply remove one of the above parameters from the config file (e.g., `resolution`).
 
-### 3. Play a Boreas sequence
+### 3. Feed it data: playback or live
 
+`dro_node` (and everything downstream of it) doesn't care where its input comes from — it just needs these three topics published:
+
+| Topic | Type | Notes |
+|-------|------|-------|
+| `/boreas/radar_image` | `sensor_msgs/Image` | Radar chirp data as an image |
+| `/boreas/radar_info` | `dre/RadarInfo` | Per-scan metadata (azimuths, timestamps, resolution); time-synchronized against `/boreas/radar_image` |
+| `/boreas/imu` | `sensor_msgs/Imu` | Buffered and matched to each radar scan's time span (waits up to 0.2s for IMU coverage before giving up on a scan) |
+
+**Option A — replay a Boreas sequence:**
 ```bash
 ros2 run dre boreas_player -p <path_to_sequence> -r <playback_rate>
 # Example:
 ros2 run dre boreas_player -p /data/boreas/boreas-2024-12-03-12-54 -r 1.0
 ```
-
 You can also make it play as fast as DRO allows by setting `-r 0` (preventing to wait between messages if your hardware is fast enough to process the data faster than real-time, and allows for slower hardware to keep up by slowing down the playback rate as needed).
+
+**Option B — feed live data:** publish the same three topics yourself (e.g. from a radar driver node) instead of running `boreas_player`. As long as the types and timestamps line up, the rest of the pipeline behaves identically to playback.
 
 ### 4. Localize against a previously built map (DRL)
 
 Point `config/config_loc.yaml`'s `map_path` at a `voxel_map.bin` produced by a previous `mapping_node` run (or an offline `dr_ba` map), set an `initial_pose` (or leave `skip_selector: false` to pick one interactively when `initial_pose_selector` starts), then:
 ```bash
-ros2 launch dre drl_launch.py
+ros2 launch dre mode_launch.py mode:=localization
 ```
 
 ## Configuration
@@ -197,10 +228,12 @@ All YAML config files live under `config/`.
 
 ## Output
 
-Atop ROS2 topics shown in RViz, the pipeline outputs the following to an output directory specified in the launch file (default is in the install space under `<ros2_ws>/install/dre/share/dre/<sequence_id>/`):
+Atop ROS2 topics shown in RViz, the pipeline outputs the following. With `mode_launch.py`, output lives under the `dre` package's source directory (not the install space, so it survives a clean rebuild) at `output/poses/<sequence_id>/` (DRO/pogo) and `output/maps/<sequence_id>/` (mapping) — each node nests its own `<sequence_id>` subdirectory, learned from the first `RadarInfo` message:
 - `odometry_result/<sequence_id>.txt`: DRO odometry trajectory using the Boreas format.
 - `pose_graph_traj.txt`: Pose-graph optimized trajectory in with `timestamp(us) x y theta` format.
-- `voxel_map.bin`, `local_maps/`, `cumulated_returns/`: `mapping_node`'s persistent voxel map and the keyframe images backing it (under the `map_output_path` argument of `mapping_launch.py`/`dre_launch.py`, default `output/boreas-live/`).
+- `voxel_map.bin`, `local_maps/`, `cumulated_returns/`: `mapping_node`'s persistent voxel map and the keyframe images backing it.
+
+(The legacy `dre_launch.py`/`mapping_launch.py` instead default to the install space, under `<ros2_ws>/install/dre/share/dre/<sequence_id>/`, with the map tree rooted at `output/boreas-live/` via their `map_output_path` argument.)
 
 ### TODOs
 
@@ -208,4 +241,5 @@ Atop ROS2 topics shown in RViz, the pipeline outputs the following to an output 
 - [ ] Improving documentation
 - [ ] Looking at making DRO even faster? (real time on my RTX 500 Mobile GPU (30W), so not a priority)
 - [ ] Adding the 3D odometry output as for 3DRO
-- [ ] Reconciling `dre_launch.py` and `mapping_launch.py` into a single forward-looking entry point
+- [ ] Adding a live-switchable `"dre"` mode to `mode_launch.py` that demotes nodes to idle instead of fully restarting them on a mode switch (needs each node to support demotion first)
+- [ ] Retiring the legacy per-pipeline launch files now that `mode_launch.py` covers all four pipelines
