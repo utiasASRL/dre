@@ -177,11 +177,13 @@ class Dro():
         self.nb_azimuths = torch.tensor(nb_azimuths).to(self.device)
         self.azimuths = torch.linspace(0.0, 2*torch.pi, nb_azimuths).to(self.device)
         res = opts['radar']['resolution']
-        if 'doppler' in opts:
+        if opts['radar']['doppler_enabled']:
             nb_ranges = int(max(float(opts['doppler']['max_range']) / res, float(opts['direct']['max_range']) / res)) + 1
         else:
             nb_ranges = int(float(opts['direct']['max_range']) / res) + 1
+        print(nb_ranges)
         warmup_img = torch.zeros((nb_azimuths, nb_ranges), device=self.device)
+        print(warmup_img.shape)
         # Populate a fake scan with enough non-zero values to build realistic sparse masks.
         nb_non_zero = min(120000, warmup_img.numel())
         indices = torch.randperm(warmup_img.numel(), device=self.device)[:nb_non_zero]
@@ -497,7 +499,7 @@ class Dro():
 
 
 
-            ### Prerparation for the direct cost
+            ### Preparation for the direct cost
             # Create the polar coordinates for the image
             self.polar_intensity = torch.tensor(polar_image[:,:max(self.max_id, self.max_range_idx_direct)]).to(self.device)
             polar_std = torch.std(self.polar_intensity, dim=1)

@@ -8,7 +8,7 @@ string sequence_id
 float32[] azimuth
 
 # Timestamps in seconds
-int64[] timestamps
+uint64[] timestamps
 
 # Azimuth resolution in radians
 float64 resolution

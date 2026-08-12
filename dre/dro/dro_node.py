@@ -18,6 +18,10 @@ from cv_bridge import CvBridge
 import pandas as pd
 import cv2
 import time
+try:
+    from navtech_msgs.msg import RadarBScanMsg
+except ImportError:
+    RadarBScanMsg = None
 
 class DroNode(Node):
     def __init__(self):
@@ -27,15 +31,19 @@ class DroNode(Node):
         # Subscribe to the imu topic
         self.imu_subscription = self.create_subscription(
             Imu,
-            '/boreas/imu',
+            '/w200_0066/sensors/imu_0/data',
             self.imuCallback,
             1000)
 
         # Subscribe synchronously to the image topic and radar info topic
-        self.image_subscription = Subscriber(self, Image, '/boreas/radar_image')
-        self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
-        self.ts = TimeSynchronizer([self.image_subscription, self.radar_info_subscription], 20)
-        self.ts.registerCallback(self.radarCallback)
+        if RadarBScanMsg is None:
+            self.image_subscription = Subscriber(self, Image, '/boreas/radar_image')
+            self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
+            self.ts = TimeSynchronizer([self.image_subscription, self.radar_info_subscription], 20)
+            self.ts.registerCallback(self.radarCallback)
+
+        else:
+            self.radar_subscription = self.create_subscription(RadarBScanMsg, '/radar_data/b_scan_msg', self.radarCombinedCallback, 10)
 
         # Set the publisher for the odometry
         self.odometry_publisher = self.create_publisher(Odometry, 'dro_odometry', 10)
@@ -95,7 +103,7 @@ class DroNode(Node):
         self.stats_start_time = None
 
         # Load the config file and populate the DRO options
-        config_file_path = "config/config_dro.yaml"
+        config_file_path = "config/config_warthog.yaml"
         base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         config_file_path = os.path.join(base_path, "share/dre", config_file_path)
         self.get_logger().info(f"Loading DRO configuration from {config_file_path}")
@@ -184,7 +192,7 @@ class DroNode(Node):
     def radarCallback(self, image_msg, radar_info_msg):
         if self.initialized == False:
             self.initialize({'sequence_id': radar_info_msg.sequence_id})
-        polar_image = np.frombuffer(image_msg.data, dtype=np.float32).reshape((image_msg.height, image_msg.width))
+        polar_image = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((image_msg.height, image_msg.width)).astype(np.float32)/255.0
         azimuths = np.asarray(radar_info_msg.azimuth, dtype=np.float32)
         timestamps = np.asarray(radar_info_msg.timestamps, dtype=np.int64)
         resolution = radar_info_msg.resolution
@@ -200,6 +208,17 @@ class DroNode(Node):
         })
 
         self.odometryStepIfReady()
+
+    def radarCombinedCallback(self, b_scan_msg):
+        image_msg = b_scan_msg.b_scan_img
+        r_info = RadarInfo()
+        r_info.sequence_id = "/tmp/dro"
+        r_info.azimuth = [2 * np.pi * float(v) / 16000 for v in b_scan_msg.encoder_values]
+        r_info.timestamps = b_scan_msg.timestamps
+        r_info.resolution = 0.040308
+        r_info.chirps = [0] * len(b_scan_msg.timestamps)
+
+        self.radarCallback(image_msg, r_info)
 
     def imuCallback(self, msg):
         time = np.int64(msg.header.stamp.sec * 1e6) + np.int64(msg.header.stamp.nanosec / 1e3)

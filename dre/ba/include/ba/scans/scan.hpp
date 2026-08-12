@@ -7,6 +7,7 @@
 #include <lgmath/se3/Operations.hpp>
 #include <ba/utils/ba_config.hpp>
 #include <random>
+#include <optional>
 
 namespace ba {
 

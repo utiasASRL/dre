@@ -4,7 +4,7 @@ pandas
 scipy
 scikit-learn
 scikit-image
-opencv-python
+opencv-python<=4.10.0.84
 matplotlib
 PyYAML
 asrl-pyboreas
