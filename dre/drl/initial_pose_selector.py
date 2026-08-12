@@ -1,31 +1,53 @@
 #!/usr/bin/env python3
 """Interactive pose selector for initialization. Click on the map to set initial pose."""
 
+import os
 import struct
+import time
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import yaml
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from ament_index_python.packages import get_package_share_directory
+from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseWithCovarianceStamped, Pose, Point, Quaternion
+from sensor_msgs.msg import Image
 from scipy.spatial.transform import Rotation as R
 
 from dre.msg import DRLEstimate
 
+# init_mode="auto": pause between chunk publishes so they're visible one-by-one in
+# rviz instead of flashing by faster than the eye can follow.
+AUTO_CHUNK_PUBLISH_DELAY_S = 0.05
+
+# init_mode="auto": skip a mapping-node pose if a chunk already exists within this
+# Euclidean distance (meters), so chunks aren't generated redundantly along a slow
+# or looping trajectory.
+AUTO_CHUNK_MIN_SPACING_M = 40.0
+
+# init_mode="auto" fake-local-map generation. Hard-coded to match config_dro.yaml's
+# `direct:` block (local_map_res / max_local_map_range) for now — TODO: read these
+# from config_dro.yaml dynamically once the auto-init pipeline is wired up end to end.
+AUTO_LOCAL_MAP_RES = 0.1          # m/pixel, matches DRO's local_map_res
+AUTO_MAX_LOCAL_MAP_RANGE = 100.0  # meters (half-width), matches DRO's max_local_map_range
+
 
 def load_voxel_map(file_path):
-    """Load voxel map and return resolution and voxels."""
+    """Load voxel map and return resolution, voxels, and mapping-node poses."""
     voxels = {}
+    poses = []
     with open(file_path, "rb") as f:
         res, = struct.unpack("<d", f.read(8))
         num_poses, = struct.unpack("<I", f.read(4))
         num_voxels, = struct.unpack("<I", f.read(4))
         pose_fmt = struct.Struct("<idddd")
         for _ in range(num_poses):
-            pose_fmt.unpack(f.read(pose_fmt.size))
+            pose_id, x, y, yaw, ate = pose_fmt.unpack(f.read(pose_fmt.size))
+            poses.append((pose_id, x, y, yaw, ate))
         vox_fmt = struct.Struct("<iid")
         for _ in range(num_voxels):
             data = f.read(vox_fmt.size)
@@ -33,7 +55,52 @@ def load_voxel_map(file_path):
                 break
             x, y, intensity = vox_fmt.unpack(data)
             voxels[(x, y)] = intensity
-    return res, voxels
+    return res, voxels, poses
+
+
+def rasterize_voxel_grid(voxels, res):
+    """Dense north-up raster of the whole voxel map: grid[row, col], row 0 = max y, col 0 = min x.
+
+    Returns (grid, ix_min, iy_max) so world (x, y) -> (row, col) via:
+        col = floor(x / res) - ix_min
+        row = iy_max - floor(y / res)
+    """
+    keys = np.asarray(list(voxels.keys()), dtype=np.int64)
+    ix_min, ix_max = int(keys[:, 0].min()), int(keys[:, 0].max())
+    iy_min, iy_max = int(keys[:, 1].min()), int(keys[:, 1].max())
+
+    grid = np.zeros((iy_max - iy_min + 1, ix_max - ix_min + 1), dtype=np.float32)
+    for (ix, iy), val in voxels.items():
+        grid[iy_max - iy, ix - ix_min] = val
+    return grid, ix_min, iy_max
+
+
+def render_local_map_chunk(grid, ix_min, iy_max, map_res, cx, cy, out_res, half_range_m):
+    """Crop a (2*half_range_m/out_res + 1) square, north-up, uint8 chunk centered on (cx, cy).
+
+    The source `grid` is at the voxel map's native `map_res` (typically coarser than
+    `out_res`); the crop is upsampled with nearest-neighbor so the output matches the
+    pixel footprint of a real DRO local map without inventing detail.
+    """
+    half_idx_src = int(round(half_range_m / map_res))
+    center_col = int(np.floor(cx / map_res)) - ix_min
+    center_row = iy_max - int(np.floor(cy / map_res))
+
+    src_size = 2 * half_idx_src + 1
+    patch = np.zeros((src_size, src_size), dtype=np.float32)
+
+    row0, row1 = center_row - half_idx_src, center_row + half_idx_src + 1
+    col0, col1 = center_col - half_idx_src, center_col + half_idx_src + 1
+    grid_h, grid_w = grid.shape
+    src_row0, src_row1 = max(row0, 0), min(row1, grid_h)
+    src_col0, src_col1 = max(col0, 0), min(col1, grid_w)
+    if src_row0 < src_row1 and src_col0 < src_col1:
+        patch[src_row0 - row0:src_row1 - row0, src_col0 - col0:src_col1 - col0] = \
+            grid[src_row0:src_row1, src_col0:src_col1]
+
+    out_size = 2 * int(round(half_range_m / out_res)) + 1
+    resized = cv2.resize(patch, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+    return (np.clip(resized, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 class InitialPoseSelectorNode(Node):
@@ -49,8 +116,23 @@ class InitialPoseSelectorNode(Node):
             PoseWithCovarianceStamped, "/initialpose", qos
         )
 
+        # init_mode="auto": publishes each fake local_map chunk as it's generated, for rviz
+        # viewing and for raplace_node to ingest. KEEP_ALL so the burst of chunks (published
+        # much faster than raplace's per-image Radon transform can consume them) isn't
+        # silently truncated by a shallow KEEP_LAST queue.
+        chunk_qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_ALL)
+        self.chunk_pub_ = self.create_publisher(Image, "place_candidate", chunk_qos)
+        self.bridge_ = CvBridge()
+
         self.fig_ = None
         self.shutdown_requested_ = False
+
+        # init_mode="auto": maps each published place_candidate chunk's timestamp
+        # (microseconds, same key raplace_node/registration_node reference as
+        # candidate_time / registration_relative_pose's header.frame_id) to the
+        # chunk's known world-frame (map) pose — populated in run_auto_init().
+        # Lives entirely in this process; no need to publish it anywhere.
+        self.chunk_world_poses_ = {}
 
         # This node's purpose is served once loc_node has consumed the initial
         # pose and started producing estimates, so shut down as soon as that
@@ -59,9 +141,18 @@ class InitialPoseSelectorNode(Node):
             DRLEstimate, "/drl_estimate", self.on_drl_estimate_received, 10
         )
 
-        # Check if interactive selector should be skipped
-        if self.skip_selector_:
-            self.publish_default_pose()
+        # Dispatch on init_mode
+        if self.init_mode_ == "start":
+            self.publish_start_pose()
+            return
+        elif self.init_mode_ == "auto":
+            self.run_auto_init()
+            return
+        elif self.init_mode_ != "selector":
+            self.get_logger().error(
+                f"init_mode '{self.init_mode_}' is not implemented yet "
+                "(supported: start, selector, auto). Not publishing an initial pose."
+            )
             return
 
         # Subscribe so the interactive window closes as soon as a pose is
@@ -72,7 +163,7 @@ class InitialPoseSelectorNode(Node):
 
         # Load map
         self.get_logger().info(f"Loading voxel map: {self.map_path_}")
-        self.res_, self.voxels_ = load_voxel_map(self.map_path_)
+        self.res_, self.voxels_, _ = load_voxel_map(self.map_path_)
         self.get_logger().info(f"Loaded {len(self.voxels_)} voxels, res={self.res_:.3f} m")
 
         # Setup map extent for coordinate conversion
@@ -140,22 +231,19 @@ class InitialPoseSelectorNode(Node):
             plt.close(self.fig_)
             self.fig_ = None
 
-    def publish_default_pose(self):
-        """Publish default initial pose without interactive selection."""
-        self.get_logger().info(
-            f"Skipping interactive selector. Publishing default pose: "
-            f"x={self.initial_x_:.2f}, y={self.initial_y_:.2f}, theta={self.initial_theta_:.2f}"
-        )
+    def publish_start_pose(self):
+        """Publish x=0, y=0, theta=0 in the map frame without interactive selection."""
+        self.get_logger().info("init_mode='start'. Publishing x=0, y=0, theta=0 in the map frame.")
 
         # Convert yaw to quaternion
-        quat = R.from_euler("z", self.initial_theta_).as_quat()
+        quat = R.from_euler("z", 0.0).as_quat()
 
         # Publish pose
         pose_msg = PoseWithCovarianceStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = "map"
 
-        pose_msg.pose.pose.position = Point(x=self.initial_x_, y=self.initial_y_, z=0.0)
+        pose_msg.pose.pose.position = Point(x=0.0, y=0.0, z=0.0)
         pose_msg.pose.pose.orientation = Quaternion(x=quat[0], y=quat[1], z=quat[2], w=quat[3])
 
         # Set covariance
@@ -164,7 +252,65 @@ class InitialPoseSelectorNode(Node):
         pose_msg.pose.covariance[35] = 0.1    # theta variance
 
         self.pose_pub_.publish(pose_msg)
-        self.get_logger().info("Default pose published to /initialpose")
+        self.get_logger().info("Start pose published to /initialpose")
+
+    def run_auto_init(self):
+        """init_mode='auto': render a fake DRO-style local_map image around each mapping-node
+        pose in the prior map. This is just the chunking step for now — nothing is fed into
+        raplace yet, chunks are written to disk so they can be inspected directly."""
+        self.get_logger().info(f"Loading voxel map: {self.map_path_}")
+        self.res_, self.voxels_, poses = load_voxel_map(self.map_path_)
+        self.get_logger().info(
+            f"Loaded {len(self.voxels_)} voxels, {len(poses)} mapping-node poses, res={self.res_:.3f} m"
+        )
+
+        grid, ix_min, iy_max = rasterize_voxel_grid(self.voxels_, self.res_)
+
+        out_dir = "auto_init_local_maps"
+        if os.path.exists(out_dir):
+            for filename in os.listdir(out_dir):
+                file_path = os.path.join(out_dir, filename)
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+        else:
+            os.makedirs(out_dir, exist_ok=True)
+
+        # Give rviz (launched alongside this node) time to come up and subscribe
+        # to place_candidate before the first chunk goes out, so nothing is missed.
+        time.sleep(2.0)
+
+        chunk_centers = np.empty((0, 2), dtype=np.float64)
+        num_written = 0
+        for pose_id, x, y, yaw, ate in poses:
+            if chunk_centers.shape[0] > 0:
+                dists = np.hypot(chunk_centers[:, 0] - x, chunk_centers[:, 1] - y)
+                if dists.min() < AUTO_CHUNK_MIN_SPACING_M:
+                    continue
+            chunk_centers = np.vstack([chunk_centers, [x, y]])
+
+            chunk = render_local_map_chunk(
+                grid, ix_min, iy_max, self.res_, x, y, AUTO_LOCAL_MAP_RES, AUTO_MAX_LOCAL_MAP_RANGE
+            )
+            cv2.imwrite(os.path.join(out_dir, f"{pose_id}.png"), chunk)
+
+            stamp = self.get_clock().now().to_msg()
+            chunk_msg = self.bridge_.cv2_to_imgmsg(chunk, encoding="mono8")
+            chunk_msg.header.stamp = stamp
+            chunk_msg.header.frame_id = "map"
+            self.chunk_pub_.publish(chunk_msg)
+
+            timestamp_us = int(stamp.sec) * 1_000_000 + int(stamp.nanosec) // 1_000
+            self.chunk_world_poses_[timestamp_us] = (x, y, yaw)
+
+            num_written += 1
+            time.sleep(AUTO_CHUNK_PUBLISH_DELAY_S)
+
+        out_size = 2 * int(round(AUTO_MAX_LOCAL_MAP_RANGE / AUTO_LOCAL_MAP_RES)) + 1
+        self.get_logger().info(
+            f"Wrote {num_written}/{len(poses)} fake local_map chunks to '{out_dir}/' "
+            f"(skipped poses within {AUTO_CHUNK_MIN_SPACING_M} m of an existing chunk), "
+            f"{out_size}x{out_size} px @ {AUTO_LOCAL_MAP_RES} m/px."
+        )
 
     def load_config(self):
         """Load configuration from config_loc.yaml in the installed package share dir."""
@@ -174,13 +320,7 @@ class InitialPoseSelectorNode(Node):
         with open(config_file, "r") as f:
             config = yaml.safe_load(f)
         self.map_path_ = config["map_path"]
-
-        # Load initial pose configuration
-        initial_pose_cfg = config.get("initial_pose", {})
-        self.initial_x_ = initial_pose_cfg.get("x", 0.0)
-        self.initial_y_ = initial_pose_cfg.get("y", 0.0)
-        self.initial_theta_ = initial_pose_cfg.get("theta", 0.0)
-        self.skip_selector_ = initial_pose_cfg.get("skip_selector", False)
+        self.init_mode_ = config.get("init_mode", "start")
 
     def on_click(self, event):
         """Handle mouse click on the map."""

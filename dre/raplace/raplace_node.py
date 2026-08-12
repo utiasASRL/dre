@@ -9,7 +9,9 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from skimage.transform import radon
 import yaml
 import message_filters
@@ -59,13 +61,36 @@ class RaplaceNode(Node):
         self.entries: List[MapEntry] = []
         self.theta = np.arange(0, 180)
 
+        # Behavior branches on /operational_mode (published by mode_node, latched):
+        # in "localization" mode, self.entries only ever holds place_candidate
+        # library entries (see placeCandidateCallback), and live DRO scans are
+        # only ever queried against them (queryAgainstLibrary), never inserted
+        # into history or used for mapping-style loop closure. Every other mode
+        # keeps the original insert-and-query-against-history behavior
+        # (raplaceCallback), where self.entries only ever holds regular online
+        # entries. mode_node fully restarts this node on every mode switch, so
+        # self.entries is never a mix of the two — defaults to the original
+        # behavior until a mode message actually arrives.
+        self.mode_ = None
+        mode_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.mode_sub_ = self.create_subscription(String, "/operational_mode", self.modeCallback, mode_qos)
+
         # Create a synchronous subscription with larger queue and allow_headerless=False for strict sync
         self.subs = []
         self.subs.append(message_filters.Subscriber(self, Image, "dro_local_map_image"))
         self.subs.append(message_filters.Subscriber(self, LocalMapInfo, "dro_local_map_info"))
         self.ts = message_filters.TimeSynchronizer(self.subs, 2)
         self.ts.registerCallback(self.raplaceCallback)
-    
+
+        # Pre-built library entries (e.g. map chunks from initial_pose_selector's
+        # init_mode="auto"): inserted into history so a live scan can be matched
+        # against them, but never themselves used as a query against history.
+        # KEEP_ALL so a fast burst of chunks isn't truncated while this callback's
+        # Radon transform (the slow part) works through the backlog.
+        place_candidate_qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_ALL)
+        self.place_candidate_sub = self.create_subscription(
+            Image, "place_candidate", self.placeCandidateCallback, place_candidate_qos
+        )
 
         self.cumulated_dists = []
         self.times = []
@@ -76,6 +101,10 @@ class RaplaceNode(Node):
         self.get_logger().info(
             f"RaPlace online node started. Subscribed to 'dro_local_map_image' and 'dro_odometry'. Publishing candidates on 'raplace_loop_candidate'."
         )
+
+    def modeCallback(self, msg: String):
+        self.mode_ = msg.data
+        self.get_logger().info(f"Operational mode set to '{self.mode_}'.")
 
     def timestampToFileName(self, timestamp_us: int) -> str:
         return os.path.join(self.output_dir, f"{timestamp_us}.png")
@@ -125,7 +154,10 @@ class RaplaceNode(Node):
         return file_path
 
     def findBestCandidate(self, query_entry: MapEntry, odom_pose: np.ndarray):
-        # Only compare with entries that are sufficiently far in time and space
+        # Only compare with entries that are sufficiently far in time and space.
+        # self.entries only ever holds regular online entries when this is called
+        # (see the class docstring comment in __init__) — no library-entry bypass
+        # needed here any more.
         time_mask = np.array(self.times) < (query_entry.timestamp_us - self.min_time_diff * 1e6)
         if not np.any(time_mask):
             return None
@@ -140,11 +172,31 @@ class RaplaceNode(Node):
 
         query_norm = (query_entry.sinofft - np.mean(query_entry.sinofft)) / (np.std(query_entry.sinofft) + 1e-8)
 
-
         best_entry = None
         best_score = -1.0
         for idx in valid_ids:
             entry = self.entries[idx]
+            score = self.fastDft(query_norm, entry.sinofft)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+
+        self_score = self.fastDft(query_norm, query_norm)
+        min_dist = abs(self_score - best_score)
+        return best_entry, best_score, min_dist
+
+    def findBestLibraryMatch(self, query_entry: MapEntry):
+        # In localization mode, self.entries only ever holds place_candidate
+        # library entries — no odometry, so no time/space gating applies or
+        # makes sense; every entry is a valid candidate.
+        if not self.entries:
+            return None
+
+        query_norm = (query_entry.sinofft - np.mean(query_entry.sinofft)) / (np.std(query_entry.sinofft) + 1e-8)
+
+        best_entry = None
+        best_score = -1.0
+        for entry in self.entries:
             score = self.fastDft(query_norm, entry.sinofft)
             if score > best_score:
                 best_score = score
@@ -169,6 +221,11 @@ class RaplaceNode(Node):
         out.candidate_image_path = candidate_entry.image_path
         out.resolution = float(self.pix_res) if self.pix_res is not None else -1.0
         self.candidate_pub.publish(out)
+        self.get_logger().info(
+            f"Published candidate: query_idx={query_entry.index} candidate_idx={candidate_entry.index} "
+            f"query_t={query_entry.timestamp_us} candidate_t={candidate_entry.timestamp_us} "
+            f"score={score:.3f} min_dist={min_dist:.3f}"
+        )
 
     def raplaceCallback(self, image_msg: Image, info_msg: LocalMapInfo):
         # Get the resolution of the local map from the first message
@@ -176,6 +233,12 @@ class RaplaceNode(Node):
             self.pix_res = info_msg.resolution
             self.get_logger().info(f"Set pixel resolution to {self.pix_res} m/px based on the first received LocalMapInfo message.")
 
+        image_np = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((image_msg.height, image_msg.width))
+        timestamp_us = self.timestamp2us(image_msg)
+
+        if self.mode_ == "localization":
+            self.queryAgainstLibrary(image_msg, image_np, timestamp_us)
+            return
 
         # Compute the cumulated distance based on the odometry info
         xy = np.array([info_msg.x, info_msg.y])
@@ -186,10 +249,6 @@ class RaplaceNode(Node):
             self.cumulated_dists.append(dist + (self.cumulated_dists[-1]))
         self.odome_poses.append(np.array([info_msg.x, info_msg.y, info_msg.theta]))
 
-
-        # Convert the incoming Image message to a numpy array
-        image_np = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((image_msg.height, image_msg.width))
-        timestamp_us = self.timestamp2us(image_msg)
         odom_pose = np.array([info_msg.x, info_msg.y, info_msg.theta])
 
         # Create a new MapEntry (including computing the sinofft)
@@ -205,13 +264,51 @@ class RaplaceNode(Node):
         # Save the local map image to disk
         self.saveLocalMap(image_np, timestamp_us)
 
-
         # Find the best candidate for loop closure and publish it if it exists
         best_match = self.findBestCandidate(map_entry, odom_pose)
         if best_match is not None:
             best_entry, best_score, min_dist = best_match
             self.publishCandidate(map_entry, best_entry, best_score, min_dist, image_msg)
-        
+
+    def queryAgainstLibrary(self, image_msg: Image, image_np: np.ndarray, timestamp_us: int):
+        # Transient query: never added to self.entries, so it never pollutes the
+        # library and never gets matched against by a later query. Still saved to
+        # disk under a real path — registration_node loads images by path, not
+        # from the message itself.
+        image_path = self.saveLocalMap(image_np, timestamp_us)
+        query_entry = MapEntry(
+            index=-1,
+            timestamp_us=timestamp_us,
+            image_path=image_path,
+            sinofft=self.computeSinofft(image_np),
+        )
+
+        best_match = self.findBestLibraryMatch(query_entry)
+        if best_match is not None:
+            best_entry, best_score, min_dist = best_match
+            self.publishCandidate(query_entry, best_entry, best_score, min_dist, image_msg)
+        else:
+            self.get_logger().warn(
+                "Live query received but the place_candidate library is empty "
+                "(chunks not published/received yet?) — skipping."
+            )
+
+    def placeCandidateCallback(self, image_msg: Image):
+        image_np = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((image_msg.height, image_msg.width))
+        timestamp_us = self.timestamp2us(image_msg)
+
+        map_entry = MapEntry(
+            index=len(self.entries),
+            timestamp_us=timestamp_us,
+            image_path=self.timestampToFileName(timestamp_us),
+            sinofft=self.computeSinofft(image_np),
+        )
+        self.entries.append(map_entry)
+
+        self.saveLocalMap(image_np, timestamp_us)
+
+        self.get_logger().info(f"Inserted place_candidate into history (library size={len(self.entries)}).")
+
 
 
 

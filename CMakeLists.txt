@@ -60,6 +60,12 @@ install(PROGRAMS
   RENAME registration_node
 )
 
+install(PROGRAMS
+  dre/mode_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME mode_node
+)
+
 install(FILES
   dre/dro/dro.py
   dre/dro/dro_motion_models.py

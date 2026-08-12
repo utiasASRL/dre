@@ -52,6 +52,6 @@ def generate_launch_description() -> LaunchDescription:
                     on_stdout=launch_rviz_when_ready,
                     on_stderr=launch_rviz_when_ready,
                 )
-            ),
+launch/dre_launch.py            ),
         ]
     )

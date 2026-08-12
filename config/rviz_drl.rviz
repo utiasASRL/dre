@@ -12,6 +12,7 @@ Panels:
         - /dro_local_map1
         - /loc_overlay1
         - /raw_radar1
+        - /registration_debug1
       Splitter Ratio: 0.5
     Tree Height: 363
   - Class: rviz_common/Selection
@@ -168,6 +169,20 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /Navtech/Cartesian
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: registration_debug
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /registration_debug_image
       Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true

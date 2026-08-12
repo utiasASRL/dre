@@ -22,6 +22,7 @@
 #include <filesystem>
 
 #include "dre/msg/local_map_info.hpp"
+#include "dre/msg/radar_info.hpp"
 
 #include <ba/map/voxel_map.hpp>
 #include <ba/scans/local_map_scan.hpp>
@@ -44,20 +45,16 @@ public:
         }
 
         this->declare_parameter<std::string>("output_path", "");
-        output_path_ = this->get_parameter("output_path").as_string();
-        if (output_path_.empty()) {
+        output_root_ = this->get_parameter("output_path").as_string();
+        if (output_root_.empty()) {
             throw std::runtime_error("Output path must be provided as a parameter 'output_path'.");
         }
-        fs::create_directories(output_path_);
-        map_file_path_ = (fs::path(output_path_) / "voxel_map.bin").string();
-
-        // Keyframe local maps are persisted here (same layout and stamp-based
-        // naming as DRO's offline save_local_maps output) so LocalMapScan can
-        // reload image data from disk on demand.
-        local_maps_dir_ = fs::path(output_path_) / "local_maps";
-        cumul_dir_ = fs::path(output_path_) / "cumulated_returns";
-        fs::create_directories(local_maps_dir_);
-        fs::create_directories(cumul_dir_);
+        // Actual output_path_/map_file_path_/local_maps_dir_/cumul_dir_ (all under
+        // output_root_/<sequence_id>/) aren't set up until the first RadarInfo
+        // message reveals which sequence is being processed — same deferred-init
+        // pattern dro_node.py uses, so replaying a named dataset (e.g. via
+        // boreas_player) saves under a matching subfolder instead of a fixed
+        // placeholder name that doesn't track what's actually running.
 
         load_config(config_file);
 
@@ -89,6 +86,16 @@ public:
             std::bind(&MappingNode::pogoPathCallback, this, std::placeholders::_1),
             sub_opts);
 
+        // Same topic dro_node reads sequence_id from; only used to name the
+        // output subfolder (see radarInfoCallback), unsubscribed once that's done.
+        radar_info_sub_ = create_subscription<dre::msg::RadarInfo>(
+            "/boreas/radar_info", 10,
+            std::bind(&MappingNode::radarInfoCallback, this, std::placeholders::_1),
+            sub_opts);
+
+        RCLCPP_INFO(get_logger(), "Waiting for a RadarInfo message to determine the output sequence folder under '%s'.",
+                    output_root_.c_str());
+
         // The map update runs on its own thread rather than a ROS timer: the
         // Foxy multi-threaded executor delays timers while the image
         // subscriptions keep it busy, which let the scan queue grow unboundedly.
@@ -98,8 +105,7 @@ public:
         // subscription thread, so intake never blocks on disk I/O.
         update_thread_ = std::thread(&MappingNode::updateLoop, this);
 
-        RCLCPP_INFO(get_logger(), "MappingNode started. Map will be saved to '%s' at most every %.1f s.",
-                    map_file_path_.c_str(), map_update_period_sec_);
+        RCLCPP_INFO(get_logger(), "MappingNode started.");
     }
 
     ~MappingNode() override {
@@ -202,6 +208,34 @@ private:
         return makePose(x, y, theta);
     }
 
+    // Only the first message matters (matches dro_node.py's own initialize()
+    // guard) — later messages, including from a second sequence played back in
+    // the same process, don't retarget an already-initialized output folder.
+    void radarInfoCallback(const dre::msg::RadarInfo::SharedPtr msg) {
+        if (initialized_) {
+            return;
+        }
+        initializeOutputPaths(msg->sequence_id);
+    }
+
+    void initializeOutputPaths(const std::string& sequence_id) {
+        output_path_ = (fs::path(output_root_) / sequence_id).string();
+        fs::create_directories(output_path_);
+        map_file_path_ = (fs::path(output_path_) / "voxel_map.bin").string();
+
+        // Keyframe local maps are persisted here (same layout and stamp-based
+        // naming as DRO's offline save_local_maps output) so LocalMapScan can
+        // reload image data from disk on demand.
+        local_maps_dir_ = fs::path(output_path_) / "local_maps";
+        cumul_dir_ = fs::path(output_path_) / "cumulated_returns";
+        fs::create_directories(local_maps_dir_);
+        fs::create_directories(cumul_dir_);
+
+        initialized_ = true;
+        RCLCPP_INFO(get_logger(), "Sequence '%s' detected. Map will be saved to '%s' at most every %.1f s.",
+                    sequence_id.c_str(), map_file_path_.c_str(), map_update_period_sec_);
+    }
+
     void pogoPathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
         std::vector<int64_t> times;
         std::vector<std::array<double, 3>> poses_xyt;
@@ -234,6 +268,16 @@ private:
     void localMapCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img_msg,
                           const sensor_msgs::msg::Image::ConstSharedPtr& cumul_msg,
                           const dre::msg::LocalMapInfo::ConstSharedPtr& info_msg) {
+        // In practice DRO can't produce a local map before it has processed at
+        // least one RadarInfo message itself, so this shouldn't trigger — but
+        // guard it anyway rather than writing to an empty local_maps_dir_/
+        // cumul_dir_ if that ordering assumption is ever violated.
+        if (!initialized_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                        "Dropping local map: still waiting for a RadarInfo message to determine the output folder.");
+            return;
+        }
+
         // Odometry pose from the message; used for the keyframe gate (motion
         // is measured against smooth, always-available odometry) and as the
         // initial scan pose if the pogo path does not cover this stamp yet.
@@ -770,9 +814,13 @@ private:
     std::vector<std::array<double, 3>> path_poses_xyt_;   // (x, y, yaw)
     bool path_updated_ = false;
 
-    // Output
+    // Output — output_root_ is the "output_path" parameter as given; output_path_
+    // (and the paths derived from it) aren't set until initializeOutputPaths()
+    // nests a sequence_id-named subfolder under it (see radarInfoCallback).
+    std::string output_root_;
     std::string output_path_;
     std::string map_file_path_;
+    bool initialized_ = false;
 
     std::unique_ptr<ba::VoxelMap> voxel_map_;
     // Per-voxel running sums (sum(I/cov), sum(1/cov)); entries mirror the
@@ -803,6 +851,7 @@ private:
     message_filters::Subscriber<dre::msg::LocalMapInfo> info_sub_;
     std::shared_ptr<Synchronizer> sync_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+    rclcpp::Subscription<dre::msg::RadarInfo>::SharedPtr radar_info_sub_;
 };
 
 int main(int argc, char** argv) {

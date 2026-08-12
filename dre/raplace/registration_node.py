@@ -444,20 +444,20 @@ class RegistrationNode(Node):
             t1 = time.time()
             result = self.refineRegistration(candidate_img, query_img, float(msg.resolution), result)
             t2 = time.time()
-            self.get_logger().debug(
+            self.get_logger().info(
                 f"Refinement for candidate q={msg.query_index} c={msg.candidate_index} took {(t2-t1) * 1000:.1f} ms. Final reason: {result.reason}."
             )
 
         if result.valid:
-            self.get_logger().debug(
+            self.get_logger().info(
                 f"Candidate q={msg.query_index} c={msg.candidate_index} registered successfully: "
                 f"pose={poseToxytheta(result.pose)}, scale={result.scale:.3f}, matches={result.num_matches}, reason={result.reason}."
             )
         else:
             # Most candidates fail this way (a routine "not a match", not a
-            # problem) — DEBUG only; publishResult()'s "accepted" line at INFO
-            # is the one that actually means a loop closure was found.
-            self.get_logger().debug(
+            # problem) — kept at INFO for now (devel visibility), same line
+            # publishResult() uses for the "accepted" case.
+            self.get_logger().info(
                 f"Candidate q={msg.query_index} c={msg.candidate_index} registration failed: "
                 f"scale={result.scale:.3f}, matches={result.num_matches}, reason={result.reason}."
             )

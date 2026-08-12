@@ -1,6 +1,6 @@
 # map_path: path to the voxel_map.bin produced by dr_map / dr_ba
-# map_path: /home/asrl/ros2_ws/dr_ba/output/maps/glen/boreas-2024-12-03-12-54/voxel_map.bin
-map_path: /home/asrl/ros2_ws/install/dre/share/dre/output/boreas-live/voxel_map.bin
+map_path: /home/asrl/ros2_ws/src/dre/output/maps/boreas-2025-02-22-12-18/voxel_map.bin
+# map_path: /home/asrl/ros2_ws/install/dre/share/dre/output/boreas-live/voxel_map.bin
 
 # Localization visualization parameters
 loc_viz:
@@ -18,13 +18,11 @@ num_triangles: 10
 # num_threads: number of threads for parallel processing (OpenMP)
 num_threads: 12
 
-# initial_pose: starting estimate of the robot's pose in the map frame (meters / radians).
-# Must be set close enough for the optimizer to converge on the first scan.
-initial_pose:
-  x: 0.0
-  y: 0.0
-  theta: 0.0   # radians
-  skip_selector: true  # if true, use initial_pose values directly without interactive selector
+# init_mode: how initial_pose_selector obtains loc_node's starting pose in the map frame.
+#   start    - use x=0, y=0, theta=0 directly, no interaction
+#   selector - open the interactive matplotlib map-click selector
+#   auto     - automatic initialization via raplace/registration (not implemented yet)
+init_mode: selector
 
 frame_processing:
   max_dist: 80.0           # radius (m) around current pose to query map voxels
