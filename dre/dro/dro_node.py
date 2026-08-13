@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import os
+# Enable caching of compilation
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
@@ -12,7 +16,6 @@ import numpy as np
 import yaml
 import copy
 from dro import Dro, kDefaultDroOpts
-import os
 from scipy.spatial.transform import Rotation as R
 from cv_bridge import CvBridge
 import pandas as pd
