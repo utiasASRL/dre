@@ -192,12 +192,20 @@ class DroNode(Node):
         self.initialized = True
 
 
+    # Auto-detect ns vs us radar timestamps by magnitude (ns epoch is ~1e3x larger).
+    _NANOSECOND_EPOCH_THRESHOLD = int(1e17)
+
+    def _timestampsToMicroseconds(self, timestamps):
+        if len(timestamps) > 0 and timestamps[0] > self._NANOSECOND_EPOCH_THRESHOLD:
+            return timestamps // 1000
+        return timestamps
+
     def radarCallback(self, image_msg, radar_info_msg):
         if self.initialized == False:
             self.initialize({'sequence_id': radar_info_msg.sequence_id})
         polar_image = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((image_msg.height, image_msg.width)).astype(np.float32)/255.0
         azimuths = np.asarray(radar_info_msg.azimuth, dtype=np.float32)
-        timestamps = np.asarray(radar_info_msg.timestamps, dtype=np.int64)
+        timestamps = self._timestampsToMicroseconds(np.asarray(radar_info_msg.timestamps, dtype=np.int64))
         resolution = radar_info_msg.resolution
         chirps = np.asarray(radar_info_msg.chirps, dtype=np.uint8)
 
