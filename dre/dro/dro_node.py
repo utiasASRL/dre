@@ -215,7 +215,7 @@ class DroNode(Node):
         r_info.sequence_id = "/tmp/dro"
         r_info.azimuth = [2 * np.pi * float(v) / 16000 for v in b_scan_msg.encoder_values]
         r_info.timestamps = b_scan_msg.timestamps
-        r_info.resolution = 0.040308
+        r_info.resolution = self.dro_opts['radar']['resolution']
         r_info.chirps = [0] * len(b_scan_msg.timestamps)
 
         self.radarCallback(image_msg, r_info)
