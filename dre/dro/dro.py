@@ -348,6 +348,15 @@ class Dro():
             elif offset < 0:
                 polar_image = polar_image[:, int(np.round(-offset)):]
 
+            # Re-initialize if the scan we receive is smaller than the pre-set max range size
+            if polar_image.shape[1] < int(self.max_range_idx_direct):
+                self.node.get_logger().warn(
+                    f"Radar scan has {polar_image.shape[1]} range bins, fewer than the "
+                    f"{int(self.max_range_idx_direct)} expected from direct.max_range/resolution "
+                    f"({self.opts['direct']['max_range']}/{res}). Re-initializing DRO for the "
+                    f"reduced range."
+                )
+                self.initialize({**radar_data, 'polar': polar_image})
 
             # Prepare the chirp direction
             if self.use_doppler:
@@ -622,6 +631,15 @@ class Dro():
             self.min_range_idx_direct = torch.tensor(int(np.ceil(self.opts['direct']['min_range'] / res))).to(self.device)
             self.max_id = int(self.max_range_local_map / res)
 
+            # Make sure max_range is not larger than the number of range bins in the polar image
+            polar = radar_data.get('polar')
+            if polar is not None:
+                available_range_bins = polar.shape[1]
+                if available_range_bins < int(self.max_range_idx_direct):
+                    self.max_range_idx_direct = torch.tensor(available_range_bins).to(self.device)
+                if available_range_bins < self.max_id:
+                    self.max_id = available_range_bins
+
             # Doppler shift to range
             self.shift_to_range = torch.tensor(res / 2.0).to(self.device)
             self.range_vec = torch.arange(self.max_range_idx_direct).to(self.device).float() * res + (res/2.0)
@@ -668,6 +686,8 @@ class Dro():
             # Doppler range bounds
             self.max_range_idx = int(np.floor(float(self.opts['doppler']['max_range']) / res))
             self.min_range_idx = int(np.ceil(float(self.opts['doppler']['min_range']) / res))
+            if polar is not None and available_range_bins < self.max_range_idx:
+                self.max_range_idx = available_range_bins
 
             self.gyr_bias = 0.0
 
