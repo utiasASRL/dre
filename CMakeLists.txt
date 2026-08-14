@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.18)
 project(dre)
 
 if(NOT CMAKE_CXX_STANDARD)
@@ -20,7 +20,13 @@ find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(pybind11 CONFIG QUIET)
+find_package(tf2_ros REQUIRED)
+find_package(cv_bridge REQUIRED)
 
+find_package(navtech_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(message_filters REQUIRED)
 
@@ -36,6 +42,10 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/dre/ba/include/
   DESTINATION include
 )
 
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/dre/dro/include/
+  DESTINATION include
+)
+
 install(PROGRAMS
   dre/boreas_player.py
   DESTINATION lib/${PROJECT_NAME}
@@ -45,7 +55,7 @@ install(PROGRAMS
 install(PROGRAMS
   dre/dro/dro_node.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME dro_node
+  RENAME dro_node_py
 )
 
 install(PROGRAMS
@@ -69,7 +79,7 @@ install(PROGRAMS
 install(FILES
   dre/dro/dro.py
   dre/dro/dro_motion_models.py
-  DESTINATION lib/${PROJECT_NAME}
+  DESTINATION share/${PROJECT_NAME}
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -189,6 +199,35 @@ install(PROGRAMS
   dre/drl/initial_pose_selector.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME initial_pose_selector
+)
+
+add_subdirectory(dre/dro/deps/cvnp)
+
+add_executable(dro_node
+    dre/dro/src/dro_node.cpp
+    dre/dro/src/dro_wrapper.cpp
+)
+target_include_directories(dro_node PUBLIC
+  ${EIGEN3_INCLUDE_DIR}
+)
+target_include_directories(dro_node PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/dre/dro/include")
+ament_target_dependencies(dro_node
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
+  tf2_ros
+  cv_bridge
+  navtech_msgs
+  pybind11
+  ament_index_cpp
+)
+target_link_libraries(dro_node ${PROJECT_NAME}__rosidl_typesupport_cpp ba)
+target_link_libraries(dro_node cvnp)
+
+
+install(TARGETS dro_node
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 

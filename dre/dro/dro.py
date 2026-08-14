@@ -1,12 +1,12 @@
 import time
 import os
+# Enable caching of compilation
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 import torch
 import torchvision
 import numpy as np
 from dro_motion_models import ConstBodyVelGyro, ConstVelConstW
-from sklearn.metrics import pairwise_distances
-from scipy.spatial.transform import Rotation as R
 
 
 kDefaultDroOpts = {
@@ -59,7 +59,7 @@ kDefaultDroOpts = {
 
 
 class Dro():
-    def __init__(self, opts, node):
+    def __init__(self, opts, node=None):
         torch.set_float32_matmul_precision('high')
         self.node = node
         with torch.no_grad():
@@ -159,7 +159,7 @@ class Dro():
                 import torch._logging as torch_logging
                 torch_logging.set_logs(recompiles=True, guards=True, dynamic=True)
             except Exception:
-                self.node.get_logger().warn("DRO_COMPILE_DEBUG enabled but torch._logging.set_logs is unavailable")
+                pass
 
         self.getUpDownPolarImages = torch.compile(self.getUpDownPolarImages, dynamic=True)
         self.prepareLocalMapPolarCoords = torch.compile(self.prepareLocalMapPolarCoords, dynamic=True)
@@ -181,9 +181,7 @@ class Dro():
             nb_ranges = int(max(float(opts['doppler']['max_range']) / res, float(opts['direct']['max_range']) / res)) + 1
         else:
             nb_ranges = int(float(opts['direct']['max_range']) / res) + 1
-        print(nb_ranges)
         warmup_img = torch.zeros((nb_azimuths, nb_ranges), device=self.device)
-        print(warmup_img.shape)
         # Populate a fake scan with enough non-zero values to build realistic sparse masks.
         nb_non_zero = min(120000, warmup_img.numel())
         indices = torch.randperm(warmup_img.numel(), device=self.device)[:nb_non_zero]
@@ -324,12 +322,6 @@ class Dro():
         self.previous_vel = saved_previous_vel
         self.max_diff_vel = saved_max_diff_vel
 
-                
-
-                
-                
-
-
 
     def odometryStep(self, radar_data, imu_data):
         with torch.no_grad():
@@ -350,12 +342,12 @@ class Dro():
 
             # Re-initialize if the scan we receive is smaller than the pre-set max range size
             if polar_image.shape[1] < int(self.max_range_idx_direct):
-                self.node.get_logger().warn(
-                    f"Radar scan has {polar_image.shape[1]} range bins, fewer than the "
-                    f"{int(self.max_range_idx_direct)} expected from direct.max_range/resolution "
-                    f"({self.opts['direct']['max_range']}/{res}). Re-initializing DRO for the "
-                    f"reduced range."
-                )
+                # self.node.get_logger().warn(
+                #     f"Radar scan has {polar_image.shape[1]} range bins, fewer than the "
+                #     f"{int(self.max_range_idx_direct)} expected from direct.max_range/resolution "
+                #     f"({self.opts['direct']['max_range']}/{res}). Re-initializing DRO for the "
+                #     f"reduced range."
+                # )
                 self.initialize({**radar_data, 'polar': polar_image})
 
             # Prepare the chirp direction
@@ -444,20 +436,23 @@ class Dro():
                     polar_target_cumulative = self.bilinearInterpolation(prev_shifted_cumulative, polar_coord_corrected)
                     polar_target_cumulative = torch.concatenate((polar_target_cumulative, polar_target_cumulative[0,:].unsqueeze(0)), dim=0)
                     local_map_update_cumulative = self.bilinearInterpolation(polar_target_cumulative, temp_polar_to_interp).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-                    self.node.publishCumulativeReturns(local_map_update_cumulative, timestamps[0])
+                    if self.node is not None:
+                        self.node.publishCumulativeReturns(local_map_update_cumulative, timestamps[0])
 
-                self.node.publishLocalMap(to_publish_local_map, current_xy_theta, timestamps[0])
-                if self.save_local_maps:
-                    self.node.writeLocalMap(to_publish_local_map, current_xy_theta, timestamps[0])
-                if self.save_cumulative_image:
-                    self.node.writeCumulativeImage(local_map_update_cumulative, timestamps[0])
+                if self.node is not None:
+                    self.node.publishLocalMap(to_publish_local_map, current_xy_theta, timestamps[0])
+                    if self.save_local_maps:
+                        self.node.writeLocalMap(to_publish_local_map, current_xy_theta, timestamps[0])
+                    if self.save_cumulative_image:
+                        self.node.writeCumulativeImage(local_map_update_cumulative, timestamps[0])
 
 
                 # Blur and normalise the local map
                 self.local_map_blurred = torchvision.transforms.functional.gaussian_blur(self.local_map.unsqueeze(0).unsqueeze(0), 3).squeeze()
                 normalizer = torch.max(self.local_map) / torch.max(self.local_map_blurred)
                 self.local_map_blurred *= normalizer
-
+            else:
+                to_publish_local_map = np.zeros((10, 10), dtype=np.uint8)
             torch.cuda.synchronize()
             t1 = time.time()
 
@@ -614,7 +609,7 @@ class Dro():
 
             self.prev_chirp_up = self.chirp_up
             self.step_counter += 1
-            return result.detach().cpu().numpy()
+            return result.detach().cpu().numpy(), to_publish_local_map
         
     
     def isDopplerEnabled(self, radar_data):

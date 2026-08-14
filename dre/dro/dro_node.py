@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-import os
-# Enable caching of compilation
-os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
-
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu

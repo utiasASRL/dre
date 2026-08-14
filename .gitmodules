@@ -4,3 +4,6 @@
 [submodule "dre/ba/deps/lgmath"]
 	path = dre/ba/deps/lgmath
 	url = git@github.com:utiasASRL/lgmath.git
+[submodule "dre/dro/deps/cvnp"]
+	path = dre/dro/deps/cvnp
+	url = https://github.com/pthom/cvnp.git
