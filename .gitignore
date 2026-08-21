@@ -1,5 +1,6 @@
 **/__pycache__/
 *.pyc
+*venv*
 
 # CMake build artifacts if built in-tree
 build/
