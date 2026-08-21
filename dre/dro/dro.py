@@ -52,8 +52,8 @@ kDefaultDroOpts = {
         'step_tol': 1e-5,
     },
     'log': {
-        'save_local_maps': True,
-        'save_cumulative_image': True,
+        'save_local_maps': False,
+        'save_cumulative_image': False,
     },
 }
 
