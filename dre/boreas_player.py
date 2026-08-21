@@ -42,8 +42,12 @@ class BoreasPlayerNode(Node):
         self.playback_rate = playback_rate
         self.no_wait = no_wait
 
-        if no_wait:
-            self.odom_sub = self.create_subscription(Odometry, 'dro_odometry', self.odomCallback, 10)
+        # Track the last odometry timestamp we've seen, and the last radar frame timestamp
+        # we published, so we can confirm dro_node has actually processed everything before
+        # shutting down
+        self.last_odom_stamp = None
+        self.last_published_radar_timestamp = None
+        self.odom_sub = self.create_subscription(Odometry, 'dro_odometry', self.odomCallback, 10)
 
         # Make sure the sequence path exists
         if(not os.path.exists(sequence_path)):
@@ -142,6 +146,8 @@ class BoreasPlayerNode(Node):
             if(self.next_radar is not None) and (elapsed_actual_time > (self.next_radar.timestamps[-1][0] - data_time_origin)):
                 self.get_logger().info("Publishing radar frame " + str(next_radar_idx) + " / " + str(num_frames))
 
+                self.last_published_radar_timestamp = self.next_radar.timestamp
+
                 # Publish radar image
                 polar_image = self.next_radar.polar
                 radar_image_msg = bridge.cv2_to_imgmsg(polar_image, encoding="32FC1")
@@ -196,16 +202,34 @@ class BoreasPlayerNode(Node):
             if not self.no_wait:
                 time.sleep(0.001)  # Convert microseconds to seconds
 
-            # Check for termination condition            
+            # Check for termination condition
             if (self.next_radar is None) and (next_imu_idx >= len(self.imu_timestamps)):
                 self.get_logger().info("Finished playing all data.")
                 break
 
             rclpy.spin_once(self, timeout_sec=0.001)
 
+        # Wait for confirmation (via dro_odometry) that dro_node has actually processed the
+        # last radar frame we published
+        self.get_logger().info("Waiting for dro_node to confirm the last radar frame was processed...")
+        max_wait_deadline = time.time() + 10.0
+        while time.time() < max_wait_deadline:
+            if (self.last_published_radar_timestamp is not None
+                    and self.last_odom_stamp is not None
+                    and self.last_odom_stamp >= self.last_published_radar_timestamp - 1e-3):
+                self.get_logger().info("Confirmed: last radar frame has been processed.")
+                break
+            rclpy.spin_once(self, timeout_sec=0.05)
+        else:
+            self.get_logger().warning(
+                "Timed out waiting for confirmation of the last radar frame being processed; "
+                "some tail-end frames may be missing from the output.")
+
     def odomCallback(self, msg):
-        self.next_time = msg.header.stamp.sec * 1e6 + msg.header.stamp.nanosec * 1e-3 + 1.5e6  # Add 0.5s to ensure we cover the radar timestamps
-        self.get_logger().info(f"Received odometry message, setting next_time to {self.next_time} microseconds")
+        self.last_odom_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.no_wait:
+            self.next_time = msg.header.stamp.sec * 1e6 + msg.header.stamp.nanosec * 1e-3 + 1.5e6  # Add 0.5s to ensure we cover the radar timestamps
+            self.get_logger().info(f"Received odometry message, setting next_time to {self.next_time} microseconds")
 
 def main():
     parser = argparse.ArgumentParser(description='Boreas Dataset Player Node')
