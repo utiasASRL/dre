@@ -15,7 +15,7 @@ from pyboreas.utils.odometry import (
     plot_stats,
 )
 
-default_result_path = './output'
+default_result_path = './output/poses'
 gt_path = '/home/dl/Documents/phd/data/boreas'
 dim = 2
 
