@@ -355,9 +355,9 @@ class Dro():
                     
             # Prepare the timestamps
             if self.timestamps is None:
-                self.max_diff_vel = self.max_acc * (timestamps[-1] - timestamps[0]) * 10e-6
+                self.max_diff_vel = self.max_acc * (timestamps[-1] - timestamps[0]) * 1e-6
             self.timestamps = torch.tensor(timestamps).to(self.device).squeeze()
-            delta_time = 0.25#(self.timestamps[0] - last_scan_time)*10e-6
+            delta_time = 0.25#(self.timestamps[0] - last_scan_time)*1e-6
             
 
             # Update the pose and the local map
