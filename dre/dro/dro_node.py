@@ -20,6 +20,9 @@ import cv2
 import time
 
 class DroNode(Node):
+    # Maximum time to wait for trailing IMU data after the end of a radar scan
+    MAX_TRAILING_IMU_WAIT_SEC = 0.5
+
     def __init__(self):
         super().__init__('dro_node')
         self.get_logger().info("DroNode has been started.")
@@ -36,6 +39,9 @@ class DroNode(Node):
         self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
         self.ts = TimeSynchronizer([self.image_subscription, self.radar_info_subscription], 20)
         self.ts.registerCallback(self.radarCallback)
+
+        # Re-check periodically so a buffered scan isn't stuck waiting forever once messages stop arriving
+        self.create_timer(0.1, self.odometryStepIfReady)
 
         # Set the publisher for the odometry
         self.odometry_publisher = self.create_publisher(Odometry, 'dro_odometry', 10)
@@ -84,10 +90,7 @@ class DroNode(Node):
         self.initialized = False
         self.first = True
 
-        # If we've been waiting this long for IMU data to cover the radar
-        # scan, stop waiting and extrapolate instead of stalling indefinitely.
-        self.imu_wait_timeout_sec = 0.2
-        self.imu_wait_start_time = None
+        self.pending_radar_wait_start = None
 
         # Frame processing stats
         self.frame_count = 0
@@ -230,16 +233,26 @@ class DroNode(Node):
             self.first = False
 
         last_radar_time = self.radar_data_buffer[0]['timestamps'][-1] + 2000  # Add 2ms to ensure we cover the radar timestamps
-        imu_timed_out = False
-        if self.imu_data_buffer[0]['timestamp'] > first_radar_time or self.imu_data_buffer[-1]['timestamp'] < last_radar_time:
-            if self.imu_wait_start_time is None:
-                self.imu_wait_start_time = time.time()
-            if time.time() - self.imu_wait_start_time < self.imu_wait_timeout_sec:
-                return
-            # Waited long enough: stop blocking and extrapolate instead (below).
-            imu_timed_out = True
 
-        self.imu_wait_start_time = None
+        # TODO: Support case where IMU arrives after scan starts
+        if self.imu_data_buffer[0]['timestamp'] > first_radar_time:
+            self.pending_radar_wait_start = None
+            return
+
+        # Wait for IMU to arrive or for the wait timeout to expire before processing the radar scan
+        if self.imu_data_buffer[-1]['timestamp'] < last_radar_time:
+            now = time.time()
+            if self.pending_radar_wait_start is None:
+                self.pending_radar_wait_start = now
+                return
+            if now - self.pending_radar_wait_start < self.MAX_TRAILING_IMU_WAIT_SEC:
+                return
+            self.get_logger().warn(
+                f"Trailing IMU for radar scan at {first_radar_time} did not arrive within "
+                f"{self.MAX_TRAILING_IMU_WAIT_SEC}s; processing with the IMU available so far."
+            )
+
+        self.pending_radar_wait_start = None
 
         # Get the minimum number of IMU measurements that cover the radar timestamps
         imu_times = np.array([imu['timestamp'] for imu in self.imu_data_buffer])
@@ -248,19 +261,6 @@ class DroNode(Node):
         end_idx = np.searchsorted(imu_times, last_radar_time, side='right')
         end_idx = min(len(imu_times), end_idx + 1)  # Ensure at least one IMU after the radar timestamps
         relevant_imus = self.imu_data_buffer[start_idx:end_idx]
-
-        if imu_timed_out:
-            # IMU still doesn't fully cover the scan after imu_wait_timeout_sec: hold the
-            # nearest reading flat out to the scan boundaries so setTime() still gets a
-            # validly-bracketed window, instead of blocking indefinitely.
-            if relevant_imus[0]['timestamp'] > first_radar_time:
-                synthetic_first = copy.deepcopy(relevant_imus[0])
-                synthetic_first['timestamp'] = first_radar_time - 1000
-                relevant_imus = [synthetic_first] + relevant_imus
-            if relevant_imus[-1]['timestamp'] < last_radar_time:
-                synthetic_last = copy.deepcopy(relevant_imus[-1])
-                synthetic_last['timestamp'] = last_radar_time + 1000
-                relevant_imus = relevant_imus + [synthetic_last]
 
         #self.get_logger().info(f"Processing radar scan (from {round(first_radar_time*1e-6, 3)} to {round(last_radar_time*1e-6, 3)}) with {len(relevant_imus)} IMU measurements from {round(imu_times[start_idx]*1e-6, 3)} to {round(imu_times[end_idx-1]*1e-6, 3)}")
 
