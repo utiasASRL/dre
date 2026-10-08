@@ -162,7 +162,7 @@ add_executable(loc_node
 target_include_directories(loc_node PRIVATE
   ${EIGEN3_INCLUDE_DIRS}
 )
-ament_target_dependencies(loc_node rclcpp sensor_msgs std_msgs message_filters)
+ament_target_dependencies(loc_node rclcpp sensor_msgs std_msgs nav_msgs geometry_msgs message_filters)
 target_link_libraries(loc_node ${PROJECT_NAME}__rosidl_typesupport_cpp ba)
 
 # Link remaining libraries
