@@ -131,6 +131,8 @@ def main(result_path=default_result_path):
 
     # Print the results
     for key in results:
+        if len(results[key]) == 0:
+            continue
         print('')
         print('--------Sequence type: ', key)
         t_errs = [t_err for t_err, _, _, _ in results[key].values()]
@@ -146,6 +148,13 @@ def main(result_path=default_result_path):
             print('Sequence: ', folder, ' t_err: ', np.round(results[key][folder][0],2), '% r_err: ', np.round(results[key][folder][1],5), 'deg/m')
 
 
+
+
+# Remove the path lengths without any entry in the errors (e.g. short sequences)
+# as they would lead to NaN statistics
+def keepPresentLengths(err, path_lengths):
+    lengths_present = np.unique([e[3] for e in err if e is not None])
+    return [l for l in path_lengths if l in lengths_present]
 
 
 def compute_kitti_metrics(
@@ -204,12 +213,14 @@ def compute_kitti_metrics(
 
         # 2d
         err, path_lengths = calc_sequence_errors(T_gt_seq, T_pred_seq, step_size, 2)
+        path_lengths = keepPresentLengths(err, path_lengths)
         t_err_2d, r_err_2d, _, _ = get_stats(err, path_lengths)
 
         err_2d_per_frame, err_stats_2d = get_stats_per_frame(err, path_lengths)
 
         # 3d
         err, path_lengths = calc_sequence_errors(T_gt_seq, T_pred_seq, step_size)
+        path_lengths = keepPresentLengths(err, path_lengths)
         t_err, r_err, t_err_len, r_err_len = get_stats(err, path_lengths)
 
         err_3d_per_frame, err_stats_3d = get_stats_per_frame(err, path_lengths)

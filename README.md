@@ -210,7 +210,7 @@ All YAML config files live under `config/`.
 
 | File | Node | Key parameters |
 |------|------|----------------|
-| `config_dro.yaml` | `dro_node` | Sensor extrinsics (`T_axle_radar`), range limits, GP lengthscales |
+| `config_dro.yaml` | `dro_node` | Sensor extrinsics (`T_axle_radar`), range limits, GP lengthscales, rejection of the Doppler returns of moving objects (`doppler_outlier_rejection`, `doppler_outlier_tol_vel`) |
 | `config_raplace.yaml` | `raplace_node` | `min_time_diff`, `max_odom_drift`, `max_img_size` |
 | `config_registration.yaml` | `registration_node` | `lowe_ratio`, `ransac_thr`, `max_img_size`, `use_gpu_if_available` |
 | `config_pogo.yaml` | `pogo_node` | Odometry/loop noise std-devs, loss scales, `estimate_bias` |
@@ -230,6 +230,7 @@ All YAML config files live under `config/`.
 
 Atop ROS2 topics shown in RViz, the pipeline outputs the following. With `mode_launch.py`, output lives under the `dre` package's source directory (not the install space, so it survives a clean rebuild) at `output/poses/<sequence_id>/` (DRO/pogo) and `output/maps/<sequence_id>/` (mapping) — each node nests its own `<sequence_id>` subdirectory, learned from the first `RadarInfo` message:
 - `odometry_result/<sequence_id>.txt`: DRO odometry trajectory using the Boreas format.
+- `diagnostics/nb_residuals.csv` (only with `log.save_diagnostics: true` in `config_dro.yaml`): per-scan number of Doppler/direct residuals and of Doppler sectors rejected as outliers.
 - `pose_graph_traj.txt`: Pose-graph optimized trajectory in with `timestamp(us) x y theta` format.
 - `voxel_map.bin`, `local_maps/`, `cumulated_returns/`: `mapping_node`'s persistent voxel map and the keyframe images backing it.
 
