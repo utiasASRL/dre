@@ -58,7 +58,7 @@ class BoreasPlayerNode(Node):
             up_chrips = doppler_img[:,10]
             self.next_chirps = up_chrips
 
-    def __init__(self, sequence_path, playback_rate, no_wait=False):
+    def __init__(self, sequence_path, playback_rate, no_wait=False, start_frame=0, nb_frames=-1):
         super().__init__('boreas_player_node')
 
         self.playback_rate = playback_rate
@@ -130,10 +130,17 @@ class BoreasPlayerNode(Node):
 
 
         # Initialize Boreas dataset reader
-        next_radar_idx = 0
+        next_radar_idx = start_frame
 
         # Get the timestamp of the first and last radar frames
         num_frames = len(self.boreas.radar_frames)
+        if nb_frames > 0:
+            num_frames = min(num_frames, start_frame + nb_frames)
+            # Stop the IMU shortly after the last radar frame played (frame names are timestamps in us)
+            imu_end_time = int(self.boreas.radar_frames[num_frames - 1].frame) + 1.5e6
+            keep = self.imu_timestamps <= imu_end_time
+            self.imu_timestamps = self.imu_timestamps[keep]
+            self.imu_gyr = self.imu_gyr[keep]
         next_imu_idx = 0
         self.loadNextRadar(next_radar_idx)
         data_time_origin = self.next_radar.timestamps[0][0] - 1e6
@@ -261,10 +268,12 @@ def main():
     parser = argparse.ArgumentParser(description='Boreas Dataset Player Node')
     parser.add_argument('-p', '--sequence_path', type=str, required=True, help='Path to the Boreas sequence folder')
     parser.add_argument('-r', '--playback_rate', type=float, default=1.0, help='Playback rate (1.0 = real-time). Set to 0 to publish as fast as possible after receiving the odometry message (produced by the DRO node), ignoring the timestamps. Useful for testing the odometry evaluation pipeline offline.')
+    parser.add_argument('-s', '--start_frame', type=int, default=0, help='Index of the first radar frame to play')
+    parser.add_argument('-n', '--nb_frames', type=int, default=-1, help='Number of radar frames to play (all the remaining ones if <= 0)')
     args = parser.parse_args()
 
     rclpy.init()
-    BoreasPlayerNode(args.sequence_path, args.playback_rate, args.playback_rate == 0)
+    BoreasPlayerNode(args.sequence_path, args.playback_rate, args.playback_rate == 0, args.start_frame, args.nb_frames)
     rclpy.shutdown()
 
 

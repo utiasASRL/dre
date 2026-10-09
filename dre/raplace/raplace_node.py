@@ -26,6 +26,8 @@ class MapEntry:
     timestamp_us: int
     image_path: str
     sinofft: np.ndarray
+    # Conjugate of the FFT of the sinofft along the first axis (computed once, used for the matching)
+    sinofft_fft_conj: np.ndarray = None
 
 
 class RaplaceNode(Node):
@@ -123,6 +125,29 @@ class RaplaceNode(Node):
         maxval = np.max(corrmap)
         return float(np.real(maxval))
 
+    # Same scores as fastDft(m_query, item) for a batch of items, given the conjugated FFTs of the items
+    # (K, rows, cols): by linearity, the sum over the columns of the inverse FFTs is the inverse FFT of the
+    # sum over the columns, so a single 1D inverse FFT per item is needed
+    @staticmethod
+    def fastDftBatch(m_query: np.ndarray, items_fft_conj: np.ndarray) -> np.ndarray:
+        f_query = np.fft.fft(m_query, axis=0)
+        corrmap = np.fft.ifft(np.einsum('rc,krc->kr', f_query, items_fft_conj), axis=1)
+        return np.max(np.real(corrmap), axis=1)
+
+    @staticmethod
+    def sinofftEntry(index: int, timestamp_us: int, image_path: str, sinofft: np.ndarray) -> MapEntry:
+        return MapEntry(index=index, timestamp_us=timestamp_us, image_path=image_path, sinofft=sinofft,
+                        sinofft_fft_conj=np.conj(np.fft.fft(sinofft, axis=0)))
+
+    # Best entry among the given ones for the query (the first one in case of equal scores), its score,
+    # and the difference with the score of the query with itself
+    def bestMatch(self, query_entry: MapEntry, candidates: List[MapEntry]):
+        query_norm = (query_entry.sinofft - np.mean(query_entry.sinofft)) / (np.std(query_entry.sinofft) + 1e-8)
+        scores = self.fastDftBatch(query_norm, np.stack([entry.sinofft_fft_conj for entry in candidates]))
+        best = int(np.argmax(scores))
+        self_score = float(self.fastDftBatch(query_norm, np.conj(np.fft.fft(query_norm, axis=0))[np.newaxis])[0])
+        return candidates[best], float(scores[best]), abs(self_score - float(scores[best]))
+
 
     def computeSinofft(self, img_u8: np.ndarray) -> np.ndarray:
         if img_u8.shape[0] > self.max_img_size:
@@ -169,21 +194,7 @@ class RaplaceNode(Node):
             return None
 
         valid_ids = np.where(valid_mask)[0]
-
-        query_norm = (query_entry.sinofft - np.mean(query_entry.sinofft)) / (np.std(query_entry.sinofft) + 1e-8)
-
-        best_entry = None
-        best_score = -1.0
-        for idx in valid_ids:
-            entry = self.entries[idx]
-            score = self.fastDft(query_norm, entry.sinofft)
-            if score > best_score:
-                best_score = score
-                best_entry = entry
-
-        self_score = self.fastDft(query_norm, query_norm)
-        min_dist = abs(self_score - best_score)
-        return best_entry, best_score, min_dist
+        return self.bestMatch(query_entry, [self.entries[idx] for idx in valid_ids])
 
     def findBestLibraryMatch(self, query_entry: MapEntry):
         # In localization mode, self.entries only ever holds place_candidate
@@ -191,20 +202,7 @@ class RaplaceNode(Node):
         # makes sense; every entry is a valid candidate.
         if not self.entries:
             return None
-
-        query_norm = (query_entry.sinofft - np.mean(query_entry.sinofft)) / (np.std(query_entry.sinofft) + 1e-8)
-
-        best_entry = None
-        best_score = -1.0
-        for entry in self.entries:
-            score = self.fastDft(query_norm, entry.sinofft)
-            if score > best_score:
-                best_score = score
-                best_entry = entry
-
-        self_score = self.fastDft(query_norm, query_norm)
-        min_dist = abs(self_score - best_score)
-        return best_entry, best_score, min_dist
+        return self.bestMatch(query_entry, self.entries)
 
 
 
@@ -252,7 +250,7 @@ class RaplaceNode(Node):
         odom_pose = np.array([info_msg.x, info_msg.y, info_msg.theta])
 
         # Create a new MapEntry (including computing the sinofft)
-        map_entry = MapEntry(
+        map_entry = self.sinofftEntry(
             index=len(self.entries),
             timestamp_us=timestamp_us,
             image_path=self.timestampToFileName(timestamp_us),
@@ -276,7 +274,7 @@ class RaplaceNode(Node):
         # disk under a real path — registration_node loads images by path, not
         # from the message itself.
         image_path = self.saveLocalMap(image_np, timestamp_us)
-        query_entry = MapEntry(
+        query_entry = self.sinofftEntry(
             index=-1,
             timestamp_us=timestamp_us,
             image_path=image_path,
@@ -297,7 +295,7 @@ class RaplaceNode(Node):
         image_np = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((image_msg.height, image_msg.width))
         timestamp_us = self.timestamp2us(image_msg)
 
-        map_entry = MapEntry(
+        map_entry = self.sinofftEntry(
             index=len(self.entries),
             timestamp_us=timestamp_us,
             image_path=self.timestampToFileName(timestamp_us),
