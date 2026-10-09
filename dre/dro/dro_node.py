@@ -245,8 +245,28 @@ class DroNode(Node):
 
         last_radar_time = self.radar_data_buffer[0]['timestamps'][-1] + 2000  # Add 2ms to ensure we cover the radar timestamps
 
-        # TODO: Support case where IMU arrives after scan starts
+        # No IMU at or before the scan start, so the scan's start can't be integrated.
+        # Unlike the trailing-IMU case below, waiting can only help if the missing sample
+        # is still in flight: IMU is published in time order, so once a *newer* sample is
+        # at the head of the buffer the one we need is gone for good. Bound the wait and
+        # then drop the scan — returning unconditionally here deadlocks the whole run,
+        # because the player in offline mode (`boreas_player -r 0`) only advances once it
+        # receives our odometry, so nothing would ever arrive to change this buffer again.
         if self.imu_data_buffer[0]['timestamp'] > first_radar_time:
+            now = time.time()
+            if self.pending_radar_wait_start is None:
+                self.pending_radar_wait_start = now
+                return
+            if now - self.pending_radar_wait_start < self.MAX_TRAILING_IMU_WAIT_SEC:
+                return
+            self.get_logger().warn(
+                f"No IMU at or before the start of the radar scan at {first_radar_time} "
+                f"(oldest buffered IMU is {self.imu_data_buffer[0]['timestamp']}); "
+                f"dropping the scan."
+            )
+            # last_processed_radar_end is deliberately left alone: the next scan then
+            # integrates IMU from the last scan we actually processed, covering the gap.
+            self.radar_data_buffer.pop(0)
             self.pending_radar_wait_start = None
             return
 
@@ -313,7 +333,15 @@ class DroNode(Node):
 
         # Remove the IMU measurements to keep at least one IMU before the end of the processed
         # radar (the next scan starts after it, potentially much later in case of drop out)
-        next_start_idx = np.searchsorted(imu_times, temp_last_time, side='left')
+        trim_time = temp_last_time
+        if self.radar_data_buffer:
+            # ... except consecutive scans can overlap slightly (the azimuth-boundary split
+            # makes the next scan start up to ~1.5ms *before* this one ends on Boreas).
+            # Trimming on this scan's end would then discard the last IMU before the next
+            # scan's start, and the check at the top of this function would reject that scan
+            # forever. Anchor on whichever comes first.
+            trim_time = min(trim_time, self.radar_data_buffer[0]['timestamps'][0])
+        next_start_idx = np.searchsorted(imu_times, trim_time, side='left')
         self.imu_data_buffer = self.imu_data_buffer[max(0, next_start_idx - 1):]
 
 

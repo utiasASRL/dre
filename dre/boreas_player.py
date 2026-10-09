@@ -20,6 +20,28 @@ import time
 
 
 class BoreasPlayerNode(Node):
+    # How far past the end of the last radar scan the IMU has to be published before
+    # playback is considered finished. A fraction of a second is plenty (dro_node only
+    # needs one sample past the scan's end), and it must stay below the 1.5s lookahead
+    # that odomCallback grants, or the condition could never be met in no_wait mode.
+    IMU_TAIL_MARGIN_US = 0.25e6
+
+    def trailingImuDone(self, next_imu_idx):
+        """Has enough IMU been published to cover the last radar scan?
+
+        Boreas sequences keep logging IMU after the final radar frame (6.5s of it in
+        boreas-2024-12-03-13-13), and that tail can never contribute to an odometry
+        estimate. Waiting to drain it hangs no_wait playback outright: IMU is published
+        only up to `next_time`, which advances on incoming odometry, and no odometry
+        follows the last scan.
+        """
+        if next_imu_idx >= len(self.imu_timestamps):
+            return True
+        if self.last_published_radar_end is None:
+            return False
+        return (self.imu_timestamps[next_imu_idx]
+                > self.last_published_radar_end + self.IMU_TAIL_MARGIN_US)
+
     def getElapsedTime(self):
         return ((time.time() * 1e6) - self.actual_time_origin) * self.playback_rate
     
@@ -47,6 +69,9 @@ class BoreasPlayerNode(Node):
         # shutting down
         self.last_odom_stamp = None
         self.last_published_radar_timestamp = None
+        # End (last azimuth) of the most recently published scan, used to decide how much
+        # trailing IMU still has to go out before playback can stop
+        self.last_published_radar_end = None
         self.odom_sub = self.create_subscription(Odometry, 'dro_odometry', self.odomCallback, 10)
 
         # Make sure the sequence path exists
@@ -147,6 +172,7 @@ class BoreasPlayerNode(Node):
                 self.get_logger().info("Publishing radar frame " + str(next_radar_idx) + " / " + str(num_frames))
 
                 self.last_published_radar_timestamp = self.next_radar.timestamp
+                self.last_published_radar_end = self.next_radar.timestamps[-1][0]
 
                 # Publish radar image
                 polar_image = self.next_radar.polar
@@ -203,7 +229,7 @@ class BoreasPlayerNode(Node):
                 time.sleep(0.001)  # Convert microseconds to seconds
 
             # Check for termination condition
-            if (self.next_radar is None) and (next_imu_idx >= len(self.imu_timestamps)):
+            if (self.next_radar is None) and self.trailingImuDone(next_imu_idx):
                 self.get_logger().info("Finished playing all data.")
                 break
 

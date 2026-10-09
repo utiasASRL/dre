@@ -16,7 +16,7 @@ from pyboreas.utils.odometry import (
 )
 
 default_result_path = './output/poses'
-gt_path = '/home/dl/Documents/phd/data/boreas'
+default_gt_path = '/home/clegentil/Documents/data/boreas_2'
 dim = 2
 
 # New sequences
@@ -96,9 +96,11 @@ sequence_type = {
 }
 
 
-def main(result_path=default_result_path):
-    # Get the list of folders in the result path
-    folders = [f for f in os.listdir(result_path) if osp.isdir(osp.join(result_path, f))]
+def main(result_path=default_result_path, gt_path=default_gt_path):
+    # Get the list of sequence folders in the result path (the result root can also
+    # hold non-sequence folders, e.g. the batch runner's 'logs')
+    folders = [f for f in os.listdir(result_path)
+               if f.startswith('boreas-') and osp.isdir(osp.join(result_path, f))]
     folders = sorted(folders)
 
     # Store the results per sequence type
@@ -110,8 +112,10 @@ def main(result_path=default_result_path):
 
         try:
             t_err, r_err, t_err_2d, r_err_2d = eval_odom(osp.join(result_path, folder, 'odometry_result'), gt_path, dim)
-        except:
-            print('Error in sequence: ', folder)
+        except Exception as e:
+            # Report the cause: across a whole batch, a bare "error" says nothing about
+            # whether the run crashed, was truncated, or the ground truth is missing.
+            print('Error in sequence: ', folder, ' -> ', type(e).__name__, ':', e)
             continue
 
         print('Mean translation error: ', t_err)
@@ -288,8 +292,6 @@ def eval_odom(pred="test/demo/pred/3d", gt="test/demo/gt", dim=2):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        result_path = sys.argv[1]
-    else:
-        result_path = default_result_path
-    main(result_path)
+    result_path = sys.argv[1] if len(sys.argv) > 1 else default_result_path
+    gt_path = sys.argv[2] if len(sys.argv) > 2 else default_gt_path
+    main(result_path, gt_path)

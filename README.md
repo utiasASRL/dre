@@ -195,6 +195,44 @@ ros2 run dre boreas_player -p /data/boreas/boreas-2024-12-03-12-54 -r 1.0
 ```
 You can also make it play as fast as DRO allows by setting `-r 0` (preventing to wait between messages if your hardware is fast enough to process the data faster than real-time, and allows for slower hardware to keep up by slowing down the playback rate as needed).
 
+**Option A-bis — batch-run a whole dataset folder:** `run_boreas_batch.py` runs DRO over every `boreas-*` sequence in a folder and evaluates the lot at the end. `dro_node` learns its output sequence folder from the first `RadarInfo` message and never re-initializes, so the script starts a fresh `dro_node` per sequence, waits for it to log `DRO ready`, replays the sequence, and tears it down before moving on.
+
+```bash
+python3 run_boreas_batch.py -d /path/to/boreas_data
+```
+
+By default it replays offline (`-r 0`, no waiting between frames), writes to `output/poses/<sequence_id>/` (the same tree `mode_launch.py` uses), keeps a per-sequence log under `output/poses/logs/`, and runs `boreas_eval.py` at the end against `-d` as the ground truth folder.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-d`, `--data_dir` | *(required)* | Folder containing the `boreas-*` sequence folders |
+| `-o`, `--output_path` | `output/poses` | Root folder for the per-sequence DRO output |
+| `-s`, `--sequences` | all | Only run these sequence IDs |
+| `-r`, `--playback_rate` | `0.0` | `boreas_player` playback rate; `0` means offline |
+| `--skip_existing` | `false` | Skip sequences that previously ran to completion (resume a batch); sequences that stalled or crashed are re-run |
+| `--startup_timeout` | `300` | Seconds to wait for `dro_node` to report it is ready (torch compilation is slow) |
+| `--sequence_timeout` | `7200` | Seconds to wait for one sequence to finish replaying |
+| `--stall_timeout` | `120` | Abort a sequence if no radar frame is processed for this long (`0` disables) |
+| `--no_eval` | `false` | Run the sequences only, skip `boreas_eval.py` |
+| `--gt_path` | same as `-d` | Ground-truth folder passed to `boreas_eval.py` |
+| `--no_progress` | `false` | Don't print the per-frame progress readout |
+| `-v`, `--verbose` | `false` | Echo `dro_node`'s and `boreas_player`'s output to the terminal as well as the log (replaces the progress readout) |
+
+While a sequence replays, progress is reported per frame:
+```
+[3/72] boreas-2024-12-03-13-34
+  dro_node ready, replaying (rate 0.0) ...
+  frame 600/3948 ( 15.2%) |  9.0 fps | elapsed 01:06 | eta 06:12
+```
+On a terminal this rewrites one line in place; when the output is redirected to a file (a batch left running under `nohup`, say) it prints a new line every 100 frames instead.
+
+A sequence that stops advancing for `--stall_timeout` seconds is aborted and the batch moves on, so one wedged sequence can't consume an unattended overnight run. A sequence that replays all the way through gets a `batch_complete.json` marker next to its output; `--skip_existing` keys off that marker, so resuming a batch re-runs the sequences that stalled rather than skipping them because a partial `odometry_result` file happens to exist.
+
+The evaluation can also be re-run on its own at any time:
+```bash
+python3 boreas_eval.py output/poses /path/to/boreas_data
+```
+
 **Option B — feed live data:** publish the same three topics yourself (e.g. from a radar driver node) instead of running `boreas_player`. As long as the types and timestamps line up, the rest of the pipeline behaves identically to playback.
 
 ### 4. Localize against a previously built map (DRL)
