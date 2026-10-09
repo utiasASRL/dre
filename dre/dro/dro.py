@@ -154,6 +154,9 @@ class Dro():
             self.local_map_xy = torch.stack((X, Y), dim=2).unsqueeze(-1).to(self.device)
             self.local_map_res = torch.tensor(local_map_res).to(self.device)
             self.local_map_zero_idx = torch.tensor(int(max_local_map_range/local_map_res)).to(self.device)
+            # Same on the host, and the scale of the normalised coordinates of the local map (for grid_sample)
+            self.local_map_center = float(int(max_local_map_range/local_map_res))
+            self.local_map_grid_scale = 1.0 / (local_map_res * self.local_map_center)
             self.local_map_polar = torch.zeros((self.local_map_xy.shape[0], self.local_map_xy.shape[1], 2)).to(self.device)
             self.local_map_polar[:, :, 0] = torch.atan2(self.local_map_xy[:, :, 1, 0], self.local_map_xy[:, :, 0, 0])
             self.local_map_polar[:, :, 1] = torch.sqrt(self.local_map_xy[:, :, 0, 0]**2 + self.local_map_xy[:, :, 1, 0]**2)
@@ -205,6 +208,7 @@ class Dro():
         self.polarToCartCoordCorrectionSparse = torch.compile(self.polarToCartCoordCorrectionSparse, dynamic=True)
         self.polarCoordCorrection = torch.compile(self.polarCoordCorrection)
         self.imgDopplerInterpAndJacobian = torch.compile(self.imgDopplerInterpAndJacobian, dynamic=True)
+        self.dopplerOffsetCosts = torch.compile(self.dopplerOffsetCosts, dynamic=True)
         self.cartToLocalMapIDSparse = torch.compile(self.cartToLocalMapIDSparse, dynamic=True)
         self.moveLocalMap = torch.compile(self.moveLocalMap, dynamic=True)
 
@@ -292,6 +296,7 @@ class Dro():
         self.direct_r_odd = self.direct_r_sparse[self.mask_direct_odd]
         self.direct_az_ids_even = self.direct_az_ids_sparse[self.mask_direct_even]
         self.direct_az_ids_odd = self.direct_az_ids_sparse[self.mask_direct_odd]
+        self.direct_range_sign = torch.where(self.mask_direct_even, -1.0, 1.0)
 
         # Prepare polar coordinate tensor needed by polarCoordCorrection.
         max_range_idx = self.max_range_idx if hasattr(self, 'max_range_idx') else max_range_idx_direct
@@ -327,7 +332,8 @@ class Dro():
         polar_coord_corrected = self.polarCoordCorrection(warmup_pos, warmup_rot)
         if self.use_doppler:
             self.imgDopplerInterpAndJacobian(warmup_shift)
-        cart_corrected_sparse, _, _ = self.polarToCartCoordCorrectionSparse(warmup_pos, warmup_rot, warmup_shift)
+            self.dopplerOffsetCosts(warmup_shift, torch.arange(-33, 34, device=self.device).float() * self.kDopplerOutlierShiftStep)
+        cart_corrected_sparse, _, _, _ = self.polarToCartCoordCorrectionSparse(warmup_pos, warmup_rot, warmup_shift)
         cart_idx_sparse = self.cartToLocalMapIDSparse(cart_corrected_sparse).squeeze()
         self.bilinearInterpolationSparse(self.local_map, cart_idx_sparse)
 
@@ -448,11 +454,9 @@ class Dro():
 
 
                 polar_coord_corrected = self.polarCoordCorrection(pos, rot)
-                polar_coord_corrected[:,:,0] -= (self.azimuths[0])
-                polar_coord_corrected[polar_coord_corrected[:,:,0]<0] = polar_coord_corrected[polar_coord_corrected[:,:,0]<0] + torch.tensor((2*torch.pi, 0)).to(self.device)
-                polar_coord_corrected[:,:,0] *= ((self.nb_azimuths) / (2*torch.pi))
-                polar_coord_corrected[:,:,1] -= (res/2.0)
-                polar_coord_corrected[:,:,1] /= res
+                polar_az = polar_coord_corrected[:,:,0] - self.azimuths[0]
+                polar_az = torch.where(polar_az < 0, polar_az + 2*torch.pi, polar_az) * ((self.nb_azimuths) / (2*torch.pi))
+                polar_coord_corrected = torch.stack((polar_az, (polar_coord_corrected[:,:,1] - (res/2.0)) / res), dim=2)
                 prev_shifted = torch.concatenate((prev_shifted, prev_shifted[0,:].unsqueeze(0)), dim=0)
                 polar_target = self.bilinearInterpolation(prev_shifted, polar_coord_corrected)
 
@@ -595,6 +599,8 @@ class Dro():
             self.direct_r_odd = self.direct_r_sparse[self.mask_direct_odd]
             self.direct_az_ids_even = self.direct_az_ids_sparse[self.mask_direct_even]
             self.direct_az_ids_odd = self.direct_az_ids_sparse[self.mask_direct_odd]
+            # Sign of the Doppler shift correction of the range of each point (- for the even azimuths)
+            self.direct_range_sign = torch.where(self.mask_direct_even, -1.0, 1.0)
 
 
             ### Perform the optimisation
@@ -684,15 +690,26 @@ class Dro():
         return self.vy_smoothed.clone()
 
 
+    # Velocities (n, 2) with the lateral velocity bias (fully applied above 3 m/s, proportional to the
+    # forward velocity below), and optionally their derivatives (n, 2, state_size)
+    def biasedVelocities(self, velocities, d_vel_d_state=None):
+        velocities = velocities.reshape((-1, 2))
+        fast = velocities[:, 0] > 3.0
+        vy = torch.where(fast, velocities[:, 1] + self.vy_bias, velocities[:, 1] + velocities[:, 0]*self.vy_bias/3.0)
+        velocities = torch.stack((velocities[:, 0], vy), dim=1)
+        if d_vel_d_state is None:
+            return velocities
+        d_vy = torch.where(fast.unsqueeze(-1), d_vel_d_state[:, 1, :], d_vel_d_state[:, 1, :] + self.vy_bias/3.0 * d_vel_d_state[:, 0, :])
+        return velocities, torch.stack((d_vel_d_state[:, 0, :], d_vy), dim=1)
+
+
     # Per-azimuth Doppler shifts (in bins, with the chirp direction) predicted for the given state
     def predictedDopplerShifts(self, state):
         with torch.no_grad():
             velocities, _, _ = self.motion_model.getVelPosRot(state, with_jac=False)
-            velocities = velocities.reshape((-1,1,2)).clone()
-            mask = velocities[:,0,0] > 3.0
-            velocities[mask,0,1] = velocities[mask,0,1] + self.vy_bias
-            velocities[~mask,0,1] = velocities[~mask,0,1] + velocities[~mask,0,0]*self.vy_bias/3.0
-            shifts = (velocities @ self.vel_to_bin_vec.reshape((-1,2,1))).reshape(-1)
+            velocities = self.biasedVelocities(velocities)
+            shifts = velocities[:, 0:1] * self.vel_to_bin_vec[:, 0:1] + velocities[:, 1:2] * self.vel_to_bin_vec[:, 1:2]
+            shifts = shifts.reshape(-1)
             if shifts.shape[0] == 1:
                 shifts = shifts.repeat(int(self.nb_azimuths))
             return shifts if self.chirp_up else -shifts
@@ -713,18 +730,7 @@ class Dro():
             offsets = torch.arange(-nb_steps, nb_steps + 1, device=self.device).float() * self.kDopplerOutlierShiftStep
             sector_size = max(1, int(round(self.kDopplerOutlierSectorDeg / (360.0 / nb_az))))
 
-            # Per-azimuth cost for each offset (by chunks of offsets to limit the memory)
-            costs = torch.zeros((len(offsets), nb_az), device=self.device)
-            max_bin = self.odd_coeff.shape[1] - 1
-            for start in range(0, len(offsets), 11):
-                chunk = offsets[start:start+11]
-                neg_shift = -(shifts[az_ids].unsqueeze(0) + chunk.unsqueeze(1))
-                shift_int = torch.floor(neg_shift)
-                frac = neg_shift - shift_int
-                bins = torch.clamp(self.doppler_bin_vec_sparse.unsqueeze(0) + shift_int.long(), 0, max_bin)
-                odd = frac * self.odd_coeff[az_ids.unsqueeze(0), bins] + self.odd_bias[az_ids.unsqueeze(0), bins]
-                res = odd * self.temp_even_img_sparse.unsqueeze(0)
-                costs[start:start+len(chunk)].index_add_(1, az_ids, res**3)
+            costs = self.dopplerOffsetCosts(shifts, offsets)
 
             # Aggregate the azimuths in sectors (single azimuths are too noisy)
             sector_ids = torch.div(torch.arange(nb_az, device=self.device), sector_size, rounding_mode='floor')
@@ -740,6 +746,23 @@ class Dro():
 
             self.doppler_az_weight_sparse = (~outliers)[sector_ids].float()[az_ids]
             self.doppler_outlier_stats = (int(valid.sum()), int(outliers.sum()))
+
+
+    # Doppler cost of each azimuth (K, A) for K shift offsets (same for all the azimuths) around the given
+    # per-azimuth shifts. The integer and fractional parts of the shifts only depend on the azimuth, so they
+    # are computed per azimuth and then gathered for each point (int32 flat indices in the odd image)
+    def dopplerOffsetCosts(self, shifts, offsets):
+        az_ids = self.doppler_az_ids_sparse
+        width = self.odd_coeff.shape[1]
+        neg_shift = -(shifts.unsqueeze(0) + offsets.unsqueeze(1))
+        shift_int = torch.floor(neg_shift)
+        frac = (neg_shift - shift_int)[:, az_ids]
+        bins = torch.clamp(self.doppler_bin_vec_sparse.int().unsqueeze(0) + shift_int.int()[:, az_ids], 0, width - 1)
+        flat_ids = (bins + (az_ids.int() * width).unsqueeze(0)).reshape(-1)
+        odd = (frac * self.odd_coeff.reshape(-1).index_select(0, flat_ids).reshape(frac.shape)
+               + self.odd_bias.reshape(-1).index_select(0, flat_ids).reshape(frac.shape))
+        res = odd * self.temp_even_img_sparse.unsqueeze(0)
+        return torch.zeros((offsets.shape[0], shifts.shape[0]), device=self.device).index_add_(1, az_ids, res**3)
 
 
     # Number of non-zero values used by the last registration (size of the residual vectors)
@@ -934,15 +957,15 @@ class Dro():
 
 
             
+    # Coordinates (azimuth index, range bin) of the local map pixels in the polar image of the scan
+    # (element-wise: the negative azimuths are wrapped with a 'where' instead of a boolean mask indexing)
     def prepareLocalMapPolarCoords(self, local_map_polar, res):
         with torch.no_grad():
-            temp_polar_to_interp = local_map_polar.clone()
-            temp_polar_to_interp[:,:,0] -= (self.azimuths[0])
-            temp_polar_to_interp[temp_polar_to_interp[:,:,0]<0] = temp_polar_to_interp[temp_polar_to_interp[:,:,0]<0] + torch.tensor((2*torch.pi, 0)).to(self.device)
-            temp_polar_to_interp[:,:,0] *= ((self.nb_azimuths) / (2*torch.pi))
-            temp_polar_to_interp[:,:,1] -= (res/2.0)
-            temp_polar_to_interp[:,:,1] /= res
-            return temp_polar_to_interp
+            az = local_map_polar[:,:,0] - self.azimuths[0]
+            az = torch.where(az < 0, az + 2*torch.pi, az)
+            az = az * ((self.nb_azimuths) / (2*torch.pi))
+            r = (local_map_polar[:,:,1] - (res/2.0)) / res
+            return torch.stack((az, r), dim=2)
 
 
     # Perform the bilinear interpolation of the image im at the coordinates az_r (az the vertical axis, r the horizontal axis)
@@ -1024,13 +1047,13 @@ class Dro():
         with torch.no_grad():
             state_size = len(state)
             velocities, d_vel_d_state, pos, d_pos_d_state, rot, d_rot_d_state = self.motion_model.getVelPosRot(state, with_jac=True)
-            velocities = velocities.reshape((-1,1,2))
-            mask = velocities[:,0,0] > 3.0
-            velocities[mask,0,1] = velocities[mask,0,1] + self.vy_bias
-            velocities[~mask,0,1] = velocities[~mask,0,1] + velocities[~mask,0,0]*self.vy_bias/3.0
-            d_vel_d_state[~mask,1,:] = d_vel_d_state[~mask,1,:] + self.vy_bias/3.0 * d_vel_d_state[~mask,0,:]
-            shifts = (velocities @ self.vel_to_bin_vec.reshape((-1,2,1))).squeeze()
-            d_shift_d_state = self.vel_to_bin_vec.reshape((-1,1,2)) @ d_vel_d_state
+            velocities, d_vel_d_state = self.biasedVelocities(velocities, d_vel_d_state)
+
+            # Doppler shift of each azimuth (A,) and its derivative w.r.t. the state (A, state_size)
+            shifts = (velocities[:, 0:1] * self.vel_to_bin_vec[:, 0:1] + velocities[:, 1:2] * self.vel_to_bin_vec[:, 1:2]).reshape(-1)
+            if shifts.shape[0] == 1:
+                shifts = shifts.repeat(int(self.nb_azimuths))
+            d_shift_d_state = self.vel_to_bin_vec[:, 0:1] * d_vel_d_state[:, 0, :] + self.vel_to_bin_vec[:, 1:2] * d_vel_d_state[:, 1, :]
             if not self.chirp_up:
                 shifts = -shifts
                 d_shift_d_state = -d_shift_d_state
@@ -1039,9 +1062,7 @@ class Dro():
             if doppler:
                 interp_sparse, aligned_odd_coeff_sparse = self.imgDopplerInterpAndJacobian(shifts)
                 residual = interp_sparse * self.temp_even_img_sparse
-                jacobian = aligned_odd_coeff_sparse.reshape((-1, 1, 1)) @ d_shift_d_state[self.doppler_az_ids_sparse,:,:] * (self.temp_even_img_sparse.unsqueeze(-1).unsqueeze(-1))
-                residual = residual.flatten()
-                jacobian = jacobian.reshape((-1,state_size))
+                jacobian = (aligned_odd_coeff_sparse.unsqueeze(-1) * d_shift_d_state[self.doppler_az_ids_sparse]) * self.temp_even_img_sparse.unsqueeze(-1)
 
                 # Remove the azimuths rejected as inconsistent with the ego-motion (e.g. moving objects)
                 if self.doppler_az_weight_sparse is not None:
@@ -1053,27 +1074,28 @@ class Dro():
                     jacobian = jacobian * weights
             # Direct cost
             if direct:
-                cart_corrected_sparse, d_cart_d_rot_sparse, d_cart_d_shift_sparse = self.polarToCartCoordCorrectionSparse(pos, rot, shifts)
+                cart_corrected_sparse, x_rot, y_rot, d_cart_d_shift = self.polarToCartCoordCorrectionSparse(pos, rot, shifts)
 
                 # Get the corresponding localMap coordinates
                 cart_idx_sparse = self.cartToLocalMapIDSparse(cart_corrected_sparse).squeeze()
 
                 interp_direct_sparse, d_interp_direct_d_xy_sparse = self.bilinearInterpolationSparse(self.local_map_blurred, cart_idx_sparse)
-                residual_direct_sparse = interp_direct_sparse * (self.polar_intensity_sparse)
+                residual_direct = (interp_direct_sparse * (self.polar_intensity_sparse)).flatten()
 
-                d_cart_sparse_d_state = (d_cart_d_shift_sparse @ d_shift_d_state.reshape((-1,1,state_size)))[self.direct_az_ids_sparse,:,:]
+                # Derivatives of the cartesian coordinates of each azimuth w.r.t. the state (A, 2, state_size),
+                # then of each point (with the rotation term that depends on the point)
+                d_cart_az_d_state = d_cart_d_shift.unsqueeze(-1) * d_shift_d_state.unsqueeze(1)
+                d_cart_sparse_d_state = d_cart_az_d_state[self.direct_az_ids_sparse]
                 if d_rot_d_state is not None:
-                    d_cart_sparse_d_state[:,:,-1] += (d_cart_d_rot_sparse@(d_rot_d_state[self.direct_az_ids_sparse].reshape((-1,1,1))) ).squeeze()
+                    d_rot = d_rot_d_state.reshape(-1)[self.direct_az_ids_sparse]
+                    d_cart_sparse_d_state[:,0,-1] += -y_rot * d_rot
+                    d_cart_sparse_d_state[:,1,-1] += x_rot * d_rot
                 d_cart_sparse_d_state += d_pos_d_state[self.direct_az_ids_sparse].reshape((-1,2,state_size))
-                d_cart_sparse_d_state[:,0,:] = d_cart_sparse_d_state[:,0,:] / (-self.local_map_res)
-                d_cart_sparse_d_state[:,1,:] = d_cart_sparse_d_state[:,1,:] / self.local_map_res
 
-
-                jacobian_direct_sparse = ((d_interp_direct_d_xy_sparse @ d_cart_sparse_d_state) * (self.polar_intensity_sparse.unsqueeze(-1).unsqueeze(-1))).squeeze()
-
-
-                residual_direct = residual_direct_sparse.flatten()
-                jacobian_direct = jacobian_direct_sparse.reshape((-1,state_size))
+                # Local map indices: row = x / (-res), col = y / res
+                d_interp = d_interp_direct_d_xy_sparse.reshape((-1, 2))
+                jacobian_direct = ((d_interp[:, 0:1] / (-self.local_map_res)) * d_cart_sparse_d_state[:, 0, :]
+                                   + (d_interp[:, 1:2] / self.local_map_res) * d_cart_sparse_d_state[:, 1, :]) * self.polar_intensity_sparse.unsqueeze(-1)
                 if degraded:
                     weights_direct = ((torch.clip(torch.abs(interp_direct_sparse - self.polar_intensity_sparse), 0, 1) - 1)**6 ).flatten().unsqueeze(-1)
                     jacobian_direct = jacobian_direct * weights_direct
@@ -1110,64 +1132,45 @@ class Dro():
             return interp
 
     # Correcting the scan polar coordinates to cartesian coordinates based on the per azimuth poses for the direct cost function
+    # Returns the cartesian coordinates (N, 2, 1), the rotated coordinates before translation (N,) and (N,),
+    # and the derivatives of the cartesian coordinates of each azimuth w.r.t. its Doppler shift (A, 2)
     def polarToCartCoordCorrectionSparse(self, pos, rot, doppler_shift):
         with torch.no_grad():
-            # Get the polar coordinates of the image
+            # Get the polar coordinates of the image (range corrected by the Doppler shift, with the
+            # sign depending on the chirp of the azimuth)
             c_az_min = torch.cos(self.azimuths)
             s_az_min = torch.sin(self.azimuths)
             c_az = c_az_min[self.direct_az_ids_sparse]
             s_az = s_az_min[self.direct_az_ids_sparse]
-            even_range = self.range_vec[self.direct_r_ids_even] - doppler_shift[self.direct_az_ids_even] * self.shift_to_range
-            odd_range = self.range_vec[self.direct_r_ids_odd] + doppler_shift[self.direct_az_ids_odd] * self.shift_to_range
-            x = torch.empty(self.direct_nb_non_zero, device=self.device)
-            x[self.mask_direct_even] = c_az[self.mask_direct_even] * even_range
-            x[self.mask_direct_odd] = c_az[self.mask_direct_odd] * odd_range
-            y = torch.empty(self.direct_nb_non_zero, device=self.device)
-            y[self.mask_direct_even] = s_az[self.mask_direct_even] * even_range
-            y[self.mask_direct_odd] = s_az[self.mask_direct_odd] * odd_range
-
+            ranges = self.range_vec[self.direct_r_ids_sparse] + self.direct_range_sign * (doppler_shift[self.direct_az_ids_sparse] * self.shift_to_range)
+            x = c_az * ranges
+            y = s_az * ranges
 
             # Rotate the coordinates
-            c_rot_min = torch.cos(rot.squeeze())
-            s_rot_min = torch.sin(rot.squeeze())
+            c_rot_min = torch.cos(rot.reshape(-1))
+            s_rot_min = torch.sin(rot.reshape(-1))
             c_rot = c_rot_min[self.direct_az_ids_sparse]
             s_rot = s_rot_min[self.direct_az_ids_sparse]
-            x_c_rot = x * c_rot
-            y_s_rot = y * s_rot
-            x_s_rot = x * s_rot
-            y_c_rot = y * c_rot
-            x_rot = x_c_rot - y_s_rot
-            y_rot = x_s_rot + y_c_rot
+            x_rot = x * c_rot - y * s_rot
+            y_rot = x * s_rot + y * c_rot
 
             # Translate the coordinates
-            x_trans = x_rot + pos.squeeze()[self.direct_az_ids_sparse, 0]
-            y_trans = y_rot + pos.squeeze()[self.direct_az_ids_sparse, 1]
+            pos = pos.reshape((-1, 2))
+            x_trans = x_rot + pos[self.direct_az_ids_sparse, 0]
+            y_trans = y_rot + pos[self.direct_az_ids_sparse, 1]
 
             # Stack the coordinates
             cart = torch.stack((x_trans.unsqueeze(-1), y_trans.unsqueeze(-1)), dim=1)
 
-            # Compute the jacobians
-            d_cart_d_rot = torch.zeros((self.direct_nb_non_zero, 2, 1), device=self.device)
-            d_cart_d_rot[:, 0, 0] = -y_rot
-            d_cart_d_rot[:, 1, 0] = x_rot
+            # Derivative w.r.t. the Doppler shift (- for the even azimuths), rotated
+            parity_sign = torch.ones_like(c_az_min)
+            parity_sign[::2] = -1.0
+            d_x_d_shift = c_az_min * parity_sign * self.shift_to_range
+            d_y_d_shift = s_az_min * parity_sign * self.shift_to_range
+            d_cart_d_shift = torch.stack((c_rot_min * d_x_d_shift - s_rot_min * d_y_d_shift,
+                                          s_rot_min * d_x_d_shift + c_rot_min * d_y_d_shift), dim=1)
 
-
-            d_cart_d_shift = torch.empty((self.nb_azimuths, 2, 1), device=self.device)
-            d_cart_d_shift[::2, 0, 0] = c_az_min[::2]*-self.shift_to_range
-            d_cart_d_shift[1::2, 0, 0] = c_az_min[1::2]*self.shift_to_range
-            d_cart_d_shift[::2, 1, 0] = s_az_min[::2]*-self.shift_to_range
-            d_cart_d_shift[1::2, 1, 0] = s_az_min[1::2]*self.shift_to_range
-
-            d_trans_d_cart = torch.empty((self.nb_azimuths, 2, 2), device=self.device)
-            d_trans_d_cart[:,0,0] = c_rot_min
-            d_trans_d_cart[:,0,1] = -s_rot_min
-            d_trans_d_cart[:,1,0] = s_rot_min
-            d_trans_d_cart[:,1,1] = c_rot_min
-
-
-            d_cart_d_shift = d_trans_d_cart @ d_cart_d_shift
-
-            return cart, d_cart_d_rot, d_cart_d_shift
+            return cart, x_rot, y_rot, d_cart_d_shift
 
 
     # Correcting the scan polar coordinates to cartesian coordinates based on the per azimuth poses
@@ -1223,10 +1226,10 @@ class Dro():
             # As there is no local map yet at the first scan, we remove the angular velocity
             # from the state (if any)
             if (not self.use_gyro) and (self.step_counter == 0 or doppler_only):
-                remove_angular = torch.tensor(True).to(self.device)
+                remove_angular = True
                 doppler_only = True
             else:
-                remove_angular = torch.tensor(False).to(self.device)
+                remove_angular = False
             # If there is no local map yet and no Doppler cost, we return the initial state
             # (no registration possible yet)
             if self.step_counter == 0 and not self.use_doppler:
@@ -1235,18 +1238,17 @@ class Dro():
             # The gradient ascent keep track of the last increasing state and gradient
             # Thus, if the cost function decreases, we go back to the last increasing
             # state and reduce the step size
+            # (the branches are evaluated on the device, with a single device-host synchronisation
+            # per iteration for the stopping criteria)
             state = state_init.clone()
-            first_cost = torch.tensor(np.inf).to(self.device)
-            prev_cost = first_cost
-            first_quantum = self.kOptFirstStep
-            step_quantum = first_quantum
+            prev_cost = torch.tensor(np.inf, device=self.device)
+            step_quantum = torch.tensor(self.kOptFirstStep, device=self.device)
             last_increasing_state = state.clone()
             last_increasing_grad = torch.zeros_like(state)
-            for i in torch.arange(nb_iter, device=self.device):
-                
+            for i in range(nb_iter):
                 res, jac = self.costFunctionAndJacobian(state, self.use_doppler, (not doppler_only) and (self.step_counter > 0), degraded)
 
-                if remove_angular and not self.use_gyro:
+                if remove_angular:
                     jac = jac[:, :-1]
 
 
@@ -1256,40 +1258,29 @@ class Dro():
                 if i == 0:
                     last_increasing_grad = grad.clone()
                 else:
-                    if cost < prev_cost:
-                        state = last_increasing_state.clone()
-                        grad = last_increasing_grad.clone()
-                        step_quantum = step_quantum / 2
-                    else:
-                        last_increasing_state = state.clone()
-                        last_increasing_grad = grad.clone()
+                    decreased = cost < prev_cost
+                    state = torch.where(decreased, last_increasing_state, state)
+                    grad = torch.where(decreased, last_increasing_grad, grad)
+                    step_quantum = torch.where(decreased, step_quantum / 2, step_quantum)
+                    last_increasing_state = state.clone()
+                    last_increasing_grad = grad.clone()
 
                 grad_norm = torch.linalg.norm(grad)
-
-                if step_quantum < 1e-5:
-                    break
-
-
-                if grad_norm < 1e-9:
-                    break
+                stop_before_step = (step_quantum < 1e-5) | (grad_norm < 1e-9)
                 step = (grad / grad_norm) * step_quantum
 
-                
-                if remove_angular and not self.use_gyro:
-                    step = torch.cat((step, torch.zeros(1).to(self.device)), dim=0)
-                
-                state += step
+                if remove_angular:
+                    step = torch.cat((step, torch.zeros(1, device=self.device)), dim=0)
 
                 step_norm = torch.linalg.norm(step)
                 cost_change = cost - prev_cost
+                stop_after_step = (step_norm < step_tol) | (torch.abs(cost_change/cost) < cost_tol)
 
-                if i == 0:
-                    first_cost = cost
-
-                if step_norm < step_tol:
+                stop_before_step, stop_after_step = torch.stack((stop_before_step, stop_after_step)).tolist()
+                if stop_before_step:
                     break
-
-                if torch.abs(cost_change/cost) < cost_tol:
+                state = state + step
+                if stop_after_step:
                     break
                 prev_cost = cost
 
@@ -1335,16 +1326,20 @@ class Dro():
             self.local_map[:, 0] = 0
             self.local_map[:, -1] = 0
 
-            # Get the coordinate of the new localMap in the former localMap
-            temp_rot_mat = torch.tensor([[torch.cos(rot), -torch.sin(rot)], [torch.sin(rot), torch.cos(rot)]]).to(self.device)
-            temp_pos = pos.reshape((-1,1))
-
-            # Get the new coordinates
-            new_xy = temp_rot_mat @ self.local_map_xy + temp_pos
-            new_idx = self.cartToLocalMapID(new_xy)
-
-            # Get the new localMap via bilinear interpolation
-            self.local_map = self.bilinearInterpolation(self.local_map, new_idx).squeeze().float()
+            # The new localMap pixel (x, y) is at R(rot) (x, y) + pos in the former localMap. With the
+            # pixel (row, col) at x = -(row - c)*res, y = (col - c)*res, and the normalised coordinates
+            # (col - c)/c and (row - c)/c of grid_sample (align_corners=True), this is the affine transform:
+            # col_n' = cos col_n - sin row_n + pos_y/(res c), row_n' = sin col_n + cos row_n - pos_x/(res c)
+            # (the bilinear interpolation of grid_sample with the zero borders above is the same as the
+            # interpolation with clamped coordinates)
+            c_rot = torch.cos(rot).float()
+            s_rot = torch.sin(rot).float()
+            scale = self.local_map_grid_scale
+            theta = torch.stack((torch.stack((c_rot, -s_rot, pos[1].float() * scale)),
+                                 torch.stack((s_rot, c_rot, -pos[0].float() * scale)))).unsqueeze(0)
+            grid = torch.nn.functional.affine_grid(theta, (1, 1, self.local_map.shape[0], self.local_map.shape[1]), align_corners=True)
+            self.local_map = torch.nn.functional.grid_sample(self.local_map.unsqueeze(0).unsqueeze(0), grid, mode='bilinear',
+                                                             padding_mode='zeros', align_corners=True).squeeze().float()
 
 
 

@@ -71,6 +71,10 @@ def affineToPoseAndScale(affine_matrix, pix_res, img_shape):
     return pose, scale
 
 class LocalMapRegistrator:
+    # Direct registration of the source image in the target image: maximisation of the correlation
+    # sum_p source(p) * target(T(p)) w.r.t. the 2D pose (x, y, theta) of the transformation T.
+    # Only the non-zero pixels of the source contribute to the cost and its gradient, so the
+    # computations are done on these pixels only (sparse).
     def __init__(self, source, target, res, xytheta_init=np.array([0, 0, 0]), use_gpu_if_available=True):
 
         # Check the input shapes match and that the nb of collumn and rows are odd
@@ -88,151 +92,118 @@ class LocalMapRegistrator:
         with torch.no_grad():
             self.source = torch.tensor(source, device=self.device).float()
             self.target = torch.tensor(target, device=self.device).float()
-            self.res = torch.tensor(res, device=self.device).float()
+            self.res = float(res)
             self.xytheta_init = torch.tensor(xytheta_init, device=self.device).float()
+            self.half_height = self.source.shape[0] // 2
+            self.half_width = self.source.shape[1] // 2
 
-            # Create the cartesian coordinates that correspond to each pixel of the images
-            self.cartesian_coords = torch.zeros((self.source.shape[0], self.source.shape[1], 2, 1), device=self.device)
-            self.cartesian_coords[:, :, 0, 0] = -((torch.arange(self.source.shape[0], device=self.device)- (self.source.shape[0] // 2)).float() * self.res).reshape((-1, 1))
-            self.cartesian_coords[:, :, 1, 0] = ((torch.arange(self.source.shape[1], device=self.device)- (self.source.shape[1] // 2)).float() * self.res).reshape((1, -1))
-
-        #self.costFunctionAndJacobian(self.xytheta_init, with_jac=True)
-        #self.gridSearchInitialization([[-2,2],[-2,2], [np.radians(-1.0), np.radians(1.0)]], nb_steps=3)
-        #self.register(nb_iter=1, verbose=False)
-        #self.getRegistrationScore()
+            # Cartesian coordinates and values of the non-zero pixels of the source
+            # (row r is at x = -(r - H//2)*res, column c is at y = (c - W//2)*res)
+            rows, cols = torch.nonzero(self.source, as_tuple=True)
+            self.source_values = self.source[rows, cols]
+            self.source_x = -(rows - self.half_height).float() * self.res
+            self.source_y = (cols - self.half_width).float() * self.res
 
 
-    def cartToImageID_(self, xy):
+    # Rotated source coordinates and their (row, column) coordinates in the target image for the
+    # pose(s) xytheta (shape (3,) or (K, 3), giving (N,) or (K, N) coordinates)
+    def transformSparse_(self, xytheta):
+        x, y, theta = xytheta[..., 0:1], xytheta[..., 1:2], xytheta[..., 2:3]
+        c_rot = torch.cos(theta)
+        s_rot = torch.sin(theta)
+        x_rot = c_rot * self.source_x - s_rot * self.source_y
+        y_rot = s_rot * self.source_x + c_rot * self.source_y
+        row = (x_rot + x) / (-self.res) + self.half_height
+        col = (y_rot + y) / self.res + self.half_width
+        return x_rot, y_rot, row, col
+
+
+    # Bilinear interpolation of the image im at (row, col), with the coordinates clamped to the image,
+    # and the derivatives of the interpolated values w.r.t. the row and column
+    def bilinearInterpolationSparse_(self, im, row, col, with_jac=False):
+        max_row = im.shape[0] - 1
+        max_col = im.shape[1] - 1
+        row0 = torch.floor(row).long()
+        col0 = torch.floor(col).long()
+        row1 = torch.clamp(row0 + 1, 0, max_row)
+        col1 = torch.clamp(col0 + 1, 0, max_col)
+        row0 = torch.clamp(row0, 0, max_row)
+        col0 = torch.clamp(col0, 0, max_col)
+        row = torch.clamp(row, 0, max_row)
+        col = torch.clamp(col, 0, max_col)
+
+        Ia = im[row0, col0]
+        Ib = im[row1, col0]
+        Ic = im[row0, col1]
+        Id = im[row1, col1]
+
+        one_minus_col = col1.float() - col
+        local_col = col - col0.float()
+        one_minus_row = row1.float() - row
+        local_row = row - row0.float()
+        interp = (one_minus_row * one_minus_col) * Ia + (local_row * one_minus_col) * Ib + (one_minus_row * local_col) * Ic + (local_row * local_col) * Id
+        if not with_jac:
+            return interp
+        d_interp_d_row = (Ib - Ia) * one_minus_col + (Id - Ic) * local_col
+        d_interp_d_col = (Ic - Ia) * one_minus_row + (Id - Ib) * local_row
+        return interp, d_interp_d_row, d_interp_d_col
+
+
+    # Cost (sum of the residuals source * interpolated target) and its gradient w.r.t. the pose
+    def costAndGradient(self, xytheta):
         with torch.no_grad():
-            out = torch.empty_like(xy, device=self.device)
-            out[:,:,0,0] = (xy[:,:,0,0] / (-self.res)) + (self.source.shape[0] // 2)
-            out[:,:,1,0] = (xy[:,:,1,0] / (self.res)) + (self.source.shape[1] // 2)
-            gradient = torch.tensor([[-1.0/self.res, 0], [0, 1.0/self.res]], device=self.device).reshape((1,1,2,2))
-            return out, gradient
+            x_rot, y_rot, row, col = self.transformSparse_(xytheta)
+            interp, d_row, d_col = self.bilinearInterpolationSparse_(self.target, row, col, with_jac=True)
+            cost = torch.sum(interp * self.source_values)
+            # d row / d (x, y, theta) = -1/res * (1, 0, -y_rot), d col / d (x, y, theta) = 1/res * (0, 1, x_rot)
+            weighted_d_row = (d_row * self.source_values) * (-1.0 / self.res)
+            weighted_d_col = (d_col * self.source_values) * (1.0 / self.res)
+            grad = torch.stack((torch.sum(weighted_d_row), torch.sum(weighted_d_col),
+                                torch.sum(weighted_d_col * x_rot - weighted_d_row * y_rot)))
+            return cost, grad
 
 
-    def transformSource_(self, xytheta):
+    # Cost for a batch of poses (K, 3)
+    def batchCost(self, xythetas):
         with torch.no_grad():
-            # If xytheta is a numpy array, convert it to a torch tensor
-            if isinstance(xytheta, np.ndarray):
-                xytheta = torch.tensor(xytheta, device=self.device).float()
-
-            c_rot = torch.cos(xytheta[2])
-            s_rot = torch.sin(xytheta[2])
-            rot_mat_T = torch.tensor([[c_rot, -s_rot], [s_rot, c_rot]], device=self.device).T.reshape((1,1, 2, 2))
-            pos = xytheta[:2].reshape((1,1, 2, 1)).to(self.device)
-
-            # Transform the cartesian coordinates
-            cartesian_coords_transformed = rot_mat_T @ self.cartesian_coords - rot_mat_T @ pos
-
-            # Convert the cartesian coordinates to image coordinates
-            ids, gradient = self.cartToImageID_(cartesian_coords_transformed)
-
-            # Get the interpolated source image
-            source_interp = self.bilinearInterpolation_(self.source, ids.squeeze(), with_jac=False)
-
-            # Residuals
-            residuals = source_interp * self.source
-
-            return source_interp, residuals
+            _, _, row, col = self.transformSparse_(xythetas)
+            return torch.sum(self.bilinearInterpolationSparse_(self.target, row, col) * self.source_values, dim=-1)
 
 
-    def bilinearInterpolation_(self, im, az_r, with_jac = False):
-        with torch.no_grad():
-            az0 = torch.floor(az_r[:, :, 0]).int()
-            az1 = az0 + 1
-            
-            r0 = torch.floor(az_r[:, :, 1]).int()
-            r1 = r0 + 1
-
-            az0 = torch.clamp(az0, 0, im.shape[0]-1)
-            az1 = torch.clamp(az1, 0, im.shape[0]-1)
-            r0 = torch.clamp(r0, 0, im.shape[1]-1)
-            r1 = torch.clamp(r1, 0, im.shape[1]-1)
-            az_r[:,:,0] = torch.clamp(az_r[:,:,0], 0, im.shape[0]-1)
-            az_r[:,:,1] = torch.clamp(az_r[:,:,1], 0, im.shape[1]-1)
-            
-            Ia = im[ az0, r0 ]
-            Ib = im[ az1, r0 ]
-            Ic = im[ az0, r1 ]
-            Id = im[ az1, r1 ]
-            
-            local_1_minus_r = (r1.float()-az_r[:, :, 1])
-            local_r = (az_r[:, :, 1]-r0.float())
-            local_1_minus_az = (az1.float()-az_r[:, :, 0])
-            local_az = (az_r[:, :, 0]-az0.float())
-            wa = local_1_minus_az * local_1_minus_r
-            wb = local_az * local_1_minus_r
-            wc = local_1_minus_az * local_r
-            wd = local_az * local_r
-
-            img_interp = wa*Ia + wb*Ib + wc*Ic + wd*Id
-
-            if not with_jac:
-                return img_interp
-            else:
-                d_I_d_az_r = torch.empty((az_r.shape[0], az_r.shape[1], 1, 2), device=self.device)
-                d_I_d_az_r[:, :, 0, 0] = (Ib - Ia)*local_1_minus_r + (Id - Ic)*local_r
-                d_I_d_az_r[:, :, 0, 1] = (Ic - Ia)*local_1_minus_az + (Id - Ib)*local_az
-                return img_interp, d_I_d_az_r
-        
-
-
-    #@torch.compile
+    # Gradient ascent with a normalised step, halved (and going back to the last increasing state)
+    # when the cost decreases. The branches are evaluated on the device so that there is a single
+    # device-host synchronisation per iteration (for the stopping criteria).
     def register(self, nb_iter=20, cost_tol=1e-6, step_tol=1e-6):
         with torch.no_grad():
-            # The gradient ascent keep track of the last increasing state and gradient
-            # Thus, if the cost function decreases, we go back to the last increasing
-            # state and reduce the step size
             state = self.xytheta_init.clone().to(self.device).float()
-            first_cost = torch.tensor(np.inf, device=self.device)
-            prev_cost = first_cost
-            first_quantum = self.optimisation_first_step
-            step_quantum = first_quantum
+            prev_cost = torch.tensor(np.inf, device=self.device)
+            step_quantum = torch.tensor(self.optimisation_first_step, device=self.device)
             last_increasing_state = state.clone()
             last_increasing_grad = torch.zeros_like(state)
-            for i in torch.arange(nb_iter, device=self.device):
-                
-                res, jac = self.costFunctionAndJacobian(state)
-
-                #grad = 3*torch.sum(res.flatten().unsqueeze(-1)**2 * jac.reshape((-1,jac.shape[-1])), 0)
-                #cost = torch.sum((res**3).flatten())
-                grad = torch.sum(jac, 0)
-                cost = torch.sum((res).flatten())
+            for i in range(nb_iter):
+                cost, grad = self.costAndGradient(state)
 
                 if i == 0:
                     last_increasing_grad = grad.clone()
                 else:
-                    if cost < prev_cost:
-                        state = last_increasing_state.clone()
-                        grad = last_increasing_grad.clone()
-                        step_quantum = step_quantum / 2
-                    else:
-                        last_increasing_state = state.clone()
-                        last_increasing_grad = grad.clone()
+                    decreased = cost < prev_cost
+                    state = torch.where(decreased, last_increasing_state, state)
+                    grad = torch.where(decreased, last_increasing_grad, grad)
+                    step_quantum = torch.where(decreased, step_quantum / 2, step_quantum)
+                    last_increasing_state = state.clone()
+                    last_increasing_grad = grad.clone()
 
                 grad_norm = torch.linalg.norm(grad)
-
-                if step_quantum < 1e-5:
-                    break
-
-
-                if grad_norm < 1e-9:
-                    break
+                stop_before_step = (step_quantum < 1e-5) | (grad_norm < 1e-9)
                 step = (grad / grad_norm) * step_quantum
-                
-                state += step
-
                 step_norm = torch.linalg.norm(step)
-                cost_change = cost - prev_cost
+                stop_after_step = (step_norm < step_tol) | (torch.abs((cost - prev_cost) / cost) < cost_tol)
 
-                if i == 0:
-                    first_cost = cost
-
-                if step_norm < step_tol:
+                stop_before_step, stop_after_step = torch.stack((stop_before_step, stop_after_step)).tolist()
+                if stop_before_step:
                     break
-
-                if torch.abs(cost_change/cost) < cost_tol:
+                state = state + step
+                if stop_after_step:
                     break
                 prev_cost = cost
 
@@ -243,59 +214,32 @@ class LocalMapRegistrator:
             return state_np
 
 
-    #@torch.compile
-    def costFunctionAndJacobian(self, xytheta, with_jac=True):
+    # Dense transformation of the source (for the visualisation only)
+    def transformSource_(self, xytheta):
         with torch.no_grad():
-            # Get the rotation matrix
+            # If xytheta is a numpy array, convert it to a torch tensor
+            if isinstance(xytheta, np.ndarray):
+                xytheta = torch.tensor(xytheta, device=self.device).float()
+
+            rows = torch.arange(self.source.shape[0], device=self.device).float().unsqueeze(1)
+            cols = torch.arange(self.source.shape[1], device=self.device).float().unsqueeze(0)
+            x = -(rows - self.half_height) * self.res
+            y = (cols - self.half_width) * self.res
+
+            # Inverse transformation: R^T (p - t)
             c_rot = torch.cos(xytheta[2])
             s_rot = torch.sin(xytheta[2])
-            rot_mat = torch.tensor([[c_rot, -s_rot], [s_rot, c_rot]], device=self.device).reshape((1,1, 2, 2))
-            pos = xytheta[:2].reshape((1,1, 2, 1)).to(self.device)
+            x_t = c_rot * (x - xytheta[0]) + s_rot * (y - xytheta[1])
+            y_t = -s_rot * (x - xytheta[0]) + c_rot * (y - xytheta[1])
+            row = x_t / (-self.res) + self.half_height
+            col = y_t / self.res + self.half_width
 
-            # Transform the cartesian coordinates
-            cartesian_coords_transformed = rot_mat @ self.cartesian_coords
-
-            if with_jac:
-                d_cartesian_coords_transformed_d_state = torch.zeros((self.cartesian_coords.shape[0], self.cartesian_coords.shape[1], 2, 3), device=self.device)
-                d_cartesian_coords_transformed_d_state[:,:,0, 0] = 1
-                d_cartesian_coords_transformed_d_state[:,:,1, 1] = 1
-                d_cartesian_coords_transformed_d_state[:,:,0, 2] = -cartesian_coords_transformed[:,:,1,0]
-                d_cartesian_coords_transformed_d_state[:,:,1, 2] = cartesian_coords_transformed[:,:,0,0]
-            cartesian_coords_transformed += pos
-
-            # Convert the cartesian coordinates to image coordinates
-            ids, gradient = self.cartToImageID_(cartesian_coords_transformed)
-            if with_jac:
-                d_ids_dstate = gradient @ d_cartesian_coords_transformed_d_state
-
-
-            # Get the interpolated source image
-            if with_jac:
-                source_interp, d_source_interp = self.bilinearInterpolation_(self.target, ids.squeeze(), with_jac=True)
-                d_source_interp = d_source_interp @ d_ids_dstate
-            else:
-                source_interp = self.bilinearInterpolation_(self.target, ids.squeeze(), with_jac=False)
+            source_interp = self.bilinearInterpolationSparse_(self.source, row.flatten(), col.flatten()).reshape(self.source.shape)
 
             # Residuals
             residuals = source_interp * self.source
 
-            ## For debug, visualize the source_interp and the target
-            #import matplotlib.pyplot as plt
-            #fig, axs = plt.subplots(1, 2)
-            #axs[0].imshow(self.source.cpu().numpy(), cmap='gray')
-            #axs[0].imshow(source_interp.cpu().numpy(), cmap='hot', alpha=0.5)
-            #axs[0].set_title('Target and overlay')
-            #axs[1].imshow(self.source.cpu().numpy(), cmap='gray')
-            #axs[1].set_title('Source')
-            #plt.show()
-
-            if with_jac:
-                gradient = self.source.unsqueeze(-1).unsqueeze(-1) @ d_source_interp
-                return residuals.flatten(), gradient.reshape((-1,3))
-            else:
-                return residuals.flatten()
-
-
+            return source_interp, residuals
 
 
     def displayOverlay(self, show=True):
@@ -335,30 +279,22 @@ class LocalMapRegistrator:
 
         return overlay
 
-    #@torch.compile
     def getRegistrationScore(self):
         # Compute the registration
         with torch.no_grad():
-            residuals = self.costFunctionAndJacobian(self.xytheta_init, with_jac=False)
-            return torch.sum(residuals) / torch.sum(self.target**2)
-    
-    #@torch.compile
+            cost, _ = self.costAndGradient(self.xytheta_init)
+            return cost / torch.sum(self.target**2)
+
+    # Exhaustive search on a grid around the initial pose (all the poses evaluated in a single batch,
+    # the first best pose in the x, y, theta order is kept)
     def gridSearchInitialization(self, search_ranges, nb_steps):
         with torch.no_grad():
             xs = torch.linspace(search_ranges[0][0], search_ranges[0][1], nb_steps, device=self.device) + self.xytheta_init[0]
             ys = torch.linspace(search_ranges[1][0], search_ranges[1][1], nb_steps, device=self.device) + self.xytheta_init[1]
             thetas = torch.linspace(search_ranges[2][0], search_ranges[2][1], nb_steps, device=self.device) + self.xytheta_init[2]
-            best_cost = -np.inf
-            best_state = self.xytheta_init.clone()
-            for x in xs:
-                for y in ys:
-                    for theta in thetas:
-                        cost = self.costFunctionAndJacobian(torch.tensor([x, y, theta], device=self.device), with_jac=False)
-                        cost = torch.sum(cost)
-                        if cost > best_cost:
-                            best_cost = cost
-                            best_state = torch.tensor([x, y, theta], device=self.device)
-            self.xytheta_init = best_state
+            candidates = torch.stack(torch.meshgrid(xs, ys, thetas, indexing='ij'), dim=-1).reshape((-1, 3))
+            costs = self.batchCost(candidates)
+            self.xytheta_init = candidates[torch.argmax(costs)].clone()
 
 class RegistrationNode(Node):
     def __init__(self) -> None:
@@ -593,7 +529,8 @@ class RegistrationNode(Node):
                     reg_result.scale,
                     reg_result.num_matches,
                     f"refined_{reg_result.reason}",
-                    local_map_registrator.displayOverlay(show=False)
+                    # Only needed for the debug image (published only when subscribed)
+                    local_map_registrator.displayOverlay(show=False) if self.viz_pub.get_subscription_count() > 0 else None
                 )
             else:
                 new_result = RegistrationResult(
