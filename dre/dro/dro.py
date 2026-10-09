@@ -19,6 +19,12 @@ kDefaultDroOpts = {
         'min_time_bias_init': 1.0,
         'T_axle_radar': np.eye(4),
         'gyro_bias_alpha': 0.01,
+        # Low-pass filtering of the lateral velocity
+        'smooth_vy': False,
+        'vy_smoothing_alpha': 1.0,
+        # Rejection of the Doppler sectors inconsistent with the ego-motion (e.g. moving vehicles)
+        'doppler_outlier_rejection': False,
+        'doppler_outlier_tol_vel': 2.6,
     },
     'gp': {
         'lengthscale_az': 2.0,
@@ -54,6 +60,7 @@ kDefaultDroOpts = {
     'log': {
         'save_local_maps': False,
         'save_cumulative_image': False,
+        'save_diagnostics': False,
     },
 }
 
@@ -73,6 +80,8 @@ class Dro():
             self.kOptFirstStep = 0.1
 
             self.max_diff_vel = opts['estimation']['max_acceleration'] * 0.25
+            # Time between the beginning of the previous scan and the current one (s)
+            self.delta_time = 0.25
 
             # Load the motion model
             self.use_gyro = opts['estimation']['use_gyro']
@@ -89,8 +98,35 @@ class Dro():
             self.estimate_gyro_bias = opts['estimation']['estimate_gyro_bias']
             self.estimate_vy_bias = opts['estimation']['estimate_vy_bias']
             self.vy_bias = opts['estimation']['vy_bias_prior']
+
+            # Optional low-pass filtering of the lateral velocity
+            # (vy = alpha*vy_new + (1-alpha)*vy_prev, the smaller the alpha the stronger the smoothing)
+            self.smooth_vy = bool(opts['estimation']['smooth_vy'])
+            self.vy_smoothing_alpha = float(opts['estimation']['vy_smoothing_alpha'])
+            self.vy_smoothed = None
             self.save_local_maps = opts['log']['save_local_maps']
             self.save_cumulative_image = opts['log']['save_cumulative_image']
+
+            # Rejection of the Doppler sectors inconsistent with the ego-motion (e.g. moving vehicles)
+            self.doppler_outlier_rejection = bool(opts['estimation']['doppler_outlier_rejection'])
+            # Max radial velocity difference (m/s) between a sector and the prediction to be kept
+            self.doppler_outlier_tol_vel = float(opts['estimation']['doppler_outlier_tol_vel'])
+            # Search range of the radial velocity of each sector around the prediction (m/s)
+            self.kDopplerOutlierMaxVel = 7.0
+            if self.doppler_outlier_tol_vel >= self.kDopplerOutlierMaxVel:
+                raise ValueError(f"'estimation.doppler_outlier_tol_vel' must be lower than {self.kDopplerOutlierMaxVel} m/s")
+            # Angular width of the sectors (deg)
+            self.kDopplerOutlierSectorDeg = 7.2
+            # Sectors with a peak Doppler cost below this fraction of the median are ignored (no Doppler content)
+            self.kDopplerOutlierMinEnergy = 0.1
+            # Resolution of the search (bins)
+            self.kDopplerOutlierShiftStep = 0.5
+            self.doppler_az_weight_sparse = None
+            self.doppler_outlier_stats = None
+
+            # Number of non-zero values used by each cost function (for logging)
+            self.nb_doppler_residuals = 0
+            self.nb_direct_residuals = 0
 
 
             # Initialise the GP parameters
@@ -321,6 +357,8 @@ class Dro():
         self.state_init = saved_state_init
         self.previous_vel = saved_previous_vel
         self.max_diff_vel = saved_max_diff_vel
+        # The fake timestamps must not be used as the previous scan's time
+        self.timestamps = None
 
                 
 
@@ -342,10 +380,11 @@ class Dro():
             # Dirty way to account for the offset
             offset = self.offset / res
             if offset > 0:
-                polar_image = np.concatenate(np.zeros((polar_image.shape[0], int(np.round(offset)))), polar_image, axis=1)
+                polar_image = np.concatenate((np.zeros((polar_image.shape[0], int(np.round(offset))), dtype=polar_image.dtype), polar_image), axis=1)
             elif offset < 0:
                 polar_image = polar_image[:, int(np.round(-offset)):]
 
+            self.clampRangeToData(polar_image.shape[1])
 
             # Prepare the chirp direction
             if self.use_doppler:
@@ -354,11 +393,23 @@ class Dro():
                 self.chirp_up = radar_data['chirps'][0] == 0
                     
             # Prepare the timestamps
+            scan_duration = int(timestamps[-1] - timestamps[0])
             if self.timestamps is None:
-                self.max_diff_vel = self.max_acc * (timestamps[-1] - timestamps[0]) * 1e-6
+                last_scan_time = int(timestamps[0]) - scan_duration
+                self.max_diff_vel = self.max_acc * scan_duration * 1e-6
+            else:
+                last_scan_time = self.timestamps[0].item()
             self.timestamps = torch.tensor(timestamps).to(self.device).squeeze()
-            delta_time = 0.25#(self.timestamps[0] - last_scan_time)*1e-6
-            
+            delta_time = (int(timestamps[0]) - last_scan_time) * 1e-6
+            self.delta_time = delta_time
+
+            # Small radar drop out (missing scan(s)): the time origin of the current scan is set to
+            # one scan duration after the beginning of the previous one
+            drop = delta_time > 1.5 * scan_duration * 1e-6
+            if drop:
+                self.node.get_logger().warn(f"Large time between radar scans detected: {delta_time:.3f}s")
+            scan_t0 = (last_scan_time + scan_duration) if drop else int(timestamps[0])
+
 
             # Update the pose and the local map
             if self.step_counter > 0:
@@ -366,13 +417,13 @@ class Dro():
                 vel_body, prev_scan_pos, prev_scan_rot = self.motion_model.getVelPosRot(self.state_init, with_jac=False)
 
                 # Get delta pose from the beginning of the previous scan to the beginning of the current scan
-                frame_pos, frame_rot = self.motion_model.getPosRotSingle(self.state_init, self.timestamps[0])
+                frame_pos, frame_rot = self.motion_model.getPosRotSingle(self.state_init, scan_t0)
 
                 # Update the current position and rotation
                 rot_mat = torch.tensor([[torch.cos(self.current_rot), -torch.sin(self.current_rot)], [torch.sin(self.current_rot), torch.cos(self.current_rot)]]).to(self.device)
                 self.current_pos = self.current_pos + rot_mat @ frame_pos.double()
                 self.current_rot = self.current_rot + frame_rot.double()
-                
+
                 # Prepare the local map (undistort the previous scan, project it and the local map 
                 # to the beginning of the current scan, and update the local map)
                 # Get the shift for each line 
@@ -466,7 +517,7 @@ class Dro():
             # Prepare the data in torch
             self.azimuths = torch.tensor(azimuths).to(self.device).float()
             self.nb_azimuths = torch.tensor(len(azimuths)).to(self.device)
-            self.motion_model.setTime(self.timestamps, self.timestamps[0])
+            self.motion_model.setTime(self.timestamps, torch.tensor(scan_t0, dtype=self.timestamps.dtype, device=self.device))
 
             # Initialise the direction vectors
             dirs = torch.empty((self.nb_azimuths, 2), device=self.device)
@@ -551,6 +602,15 @@ class Dro():
                 self.state_init[:2] = self.state_init[:2]*(1+self.state_init[2]*delta_time)
             if torch.norm(self.state_init[:2]) < 0.75:
                 self.state_init[:] = 0.0
+                # Reset the lateral velocity filter to avoid dragging the previous motion
+                self.vy_smoothed = None
+
+            # Reject the Doppler sectors inconsistent with the predicted ego-motion
+            self.doppler_az_weight_sparse = None
+            self.doppler_outlier_stats = None
+            if self.use_doppler and self.doppler_outlier_rejection and self.step_counter > 0:
+                self.updateDopplerOutliers(self.state_init)
+
             result = self.solve(self.state_init, self.opts['solver']['nb_iter'], self.opts['solver']['cost_tol'], self.opts['solver']['step_tol'])
 
 
@@ -561,6 +621,10 @@ class Dro():
                     if torch.abs(result[2]) > maxAngVel(result[:2]):
                         result[2] = self.prev_state[2]
                 self.prev_state = result.clone()
+
+            # Low-pass filter the lateral velocity if enabled
+            if self.smooth_vy:
+                result[1] = self.smoothVy(result[1])
 
             # Update the vy bias if needed
             if self.use_doppler and self.estimate_vy_bias and np.linalg.norm(result[:2].cpu().numpy()) > 3.0:
@@ -601,11 +665,113 @@ class Dro():
 
             self.state_init = result.clone()
 
+            # Store the number of non-zero values effectively used by each cost function
+            # (the size of the residual vectors of the registration)
+            self.nb_doppler_residuals = int(self.temp_even_img_sparse.shape[0]) if self.use_doppler else 0
+            self.nb_direct_residuals = int(self.polar_intensity_sparse.shape[0]) if self.step_counter > 0 else 0
+
             self.prev_chirp_up = self.chirp_up
             self.step_counter += 1
             return result.detach().cpu().numpy()
-        
-    
+
+
+    # Low-pass filter of the lateral velocity (first order IIR)
+    def smoothVy(self, vy):
+        if self.vy_smoothed is None:
+            self.vy_smoothed = vy.clone()
+        else:
+            self.vy_smoothed = self.vy_smoothing_alpha * vy + (1 - self.vy_smoothing_alpha) * self.vy_smoothed
+        return self.vy_smoothed.clone()
+
+
+    # Per-azimuth Doppler shifts (in bins, with the chirp direction) predicted for the given state
+    def predictedDopplerShifts(self, state):
+        with torch.no_grad():
+            velocities, _, _ = self.motion_model.getVelPosRot(state, with_jac=False)
+            velocities = velocities.reshape((-1,1,2)).clone()
+            mask = velocities[:,0,0] > 3.0
+            velocities[mask,0,1] = velocities[mask,0,1] + self.vy_bias
+            velocities[~mask,0,1] = velocities[~mask,0,1] + velocities[~mask,0,0]*self.vy_bias/3.0
+            shifts = (velocities @ self.vel_to_bin_vec.reshape((-1,2,1))).reshape(-1)
+            if shifts.shape[0] == 1:
+                shifts = shifts.repeat(int(self.nb_azimuths))
+            return shifts if self.chirp_up else -shifts
+
+
+    # Rejection of the Doppler sectors inconsistent with the predicted ego-motion (e.g. moving vehicles):
+    # 1. Doppler cost of each angular sector for radial velocity offsets around the prediction, giving the
+    #    best offset of each sector (the sectors with little Doppler content are ignored)
+    # 2. The sectors whose best offset is more than 'doppler_outlier_tol_vel' m/s away from the prediction
+    #    are removed from the Doppler cost of the scan
+    def updateDopplerOutliers(self, state):
+        with torch.no_grad():
+            nb_az = int(self.nb_azimuths)
+            az_ids = self.doppler_az_ids_sparse
+            shifts = self.predictedDopplerShifts(state)
+            tol = self.doppler_outlier_tol_vel * self.vel_to_bin
+            nb_steps = int(np.ceil(self.kDopplerOutlierMaxVel * self.vel_to_bin / self.kDopplerOutlierShiftStep))
+            offsets = torch.arange(-nb_steps, nb_steps + 1, device=self.device).float() * self.kDopplerOutlierShiftStep
+            sector_size = max(1, int(round(self.kDopplerOutlierSectorDeg / (360.0 / nb_az))))
+
+            # Per-azimuth cost for each offset (by chunks of offsets to limit the memory)
+            costs = torch.zeros((len(offsets), nb_az), device=self.device)
+            max_bin = self.odd_coeff.shape[1] - 1
+            for start in range(0, len(offsets), 11):
+                chunk = offsets[start:start+11]
+                neg_shift = -(shifts[az_ids].unsqueeze(0) + chunk.unsqueeze(1))
+                shift_int = torch.floor(neg_shift)
+                frac = neg_shift - shift_int
+                bins = torch.clamp(self.doppler_bin_vec_sparse.unsqueeze(0) + shift_int.long(), 0, max_bin)
+                odd = frac * self.odd_coeff[az_ids.unsqueeze(0), bins] + self.odd_bias[az_ids.unsqueeze(0), bins]
+                res = odd * self.temp_even_img_sparse.unsqueeze(0)
+                costs[start:start+len(chunk)].index_add_(1, az_ids, res**3)
+
+            # Aggregate the azimuths in sectors (single azimuths are too noisy)
+            sector_ids = torch.div(torch.arange(nb_az, device=self.device), sector_size, rounding_mode='floor')
+            nb_sectors = int(sector_ids[-1]) + 1
+            sector_costs = torch.zeros((len(offsets), nb_sectors), device=self.device).index_add_(1, sector_ids, costs)
+
+            best_cost, best_idx = torch.max(sector_costs, dim=0)
+            positive = best_cost[best_cost > 0]
+            if positive.numel() == 0:
+                return
+            valid = best_cost > self.kDopplerOutlierMinEnergy * torch.median(positive)
+            outliers = valid & (torch.abs(offsets[best_idx]) > tol)
+
+            self.doppler_az_weight_sparse = (~outliers)[sector_ids].float()[az_ids]
+            self.doppler_outlier_stats = (int(valid.sum()), int(outliers.sum()))
+
+
+    # Number of non-zero values used by the last registration (size of the residual vectors)
+    def getNbResiduals(self):
+        return self.nb_doppler_residuals, self.nb_direct_residuals
+
+
+    # Forces the max range indices to be within the available radar scan bins
+    def clampRangeToData(self, nb_bins_available):
+        # Nothing to do if the scan size has not changed (avoids GPU syncs at every scan)
+        if nb_bins_available == self.last_nb_bins_available:
+            return
+        self.last_nb_bins_available = nb_bins_available
+
+        if int(self.max_range_idx_direct) > nb_bins_available:
+            self.max_range_idx_direct = torch.tensor(nb_bins_available).to(self.device)
+            self.range_vec = torch.arange(self.max_range_idx_direct).to(self.device).float() * self.res + (self.res / 2.0)
+            if int(self.min_range_idx_direct) >= int(self.max_range_idx_direct):
+                raise ValueError("'direct.min_range' is beyond the range covered by the radar scan "
+                                  "once 'direct.max_range' is clamped to the available data; "
+                                  "lower 'direct.min_range' and/or 'direct.max_range' in the config.")
+
+        # The Doppler images use the bins [min_range_idx, max_range_idx] (inclusive)
+        if self.max_range_idx > nb_bins_available - 1:
+            self.max_range_idx = nb_bins_available - 1
+            self.nb_bins = self.max_range_idx - self.min_range_idx + 1 + 2*self.kImgPadding
+            if self.min_range_idx >= self.max_range_idx:
+                raise ValueError("'doppler.min_range' is beyond the range covered by the radar scan "
+                                  "once 'doppler.max_range' is clamped to the available data; "
+                                  "lower 'doppler.min_range' and/or 'doppler.max_range' in the config.")
+
+
     def isDopplerEnabled(self, radar_data):
         return radar_data['chirps'][0] != radar_data['chirps'][1]
 
@@ -614,6 +780,8 @@ class Dro():
         with torch.no_grad():
             self.initialized = True
             res = radar_data['resolution']
+            self.res = res
+            self.last_nb_bins_available = None
             self.vel_to_bin = 2*self.radar_beta / res
 
             self.max_range_idx_direct = torch.tensor(int(np.floor(self.opts['direct']['max_range'] / res))).to(self.device)
@@ -625,6 +793,10 @@ class Dro():
             self.range_vec = torch.arange(self.max_range_idx_direct).to(self.device).float() * res + (res/2.0)
 
             self.use_doppler = self.isDopplerEnabled(radar_data)
+
+            if self.use_doppler and (float(self.opts['doppler']['max_range']) < float(self.opts['direct']['max_range'])):
+                self.node.get_logger().warn("Doppler max range is less than direct max range; setting the Doppler max range to the direct max range.")
+                self.opts['doppler']['max_range'] = self.opts['direct']['max_range']
 
             range_start = int(np.ceil(float(self.opts['doppler']['min_range']) / res))
             range_end = int(np.floor(float(self.opts['doppler']['max_range']) / res))
@@ -870,6 +1042,12 @@ class Dro():
                 jacobian = aligned_odd_coeff_sparse.reshape((-1, 1, 1)) @ d_shift_d_state[self.doppler_az_ids_sparse,:,:] * (self.temp_even_img_sparse.unsqueeze(-1).unsqueeze(-1))
                 residual = residual.flatten()
                 jacobian = jacobian.reshape((-1,state_size))
+
+                # Remove the azimuths rejected as inconsistent with the ego-motion (e.g. moving objects)
+                if self.doppler_az_weight_sparse is not None:
+                    residual = residual * self.doppler_az_weight_sparse
+                    jacobian = jacobian * self.doppler_az_weight_sparse.unsqueeze(-1)
+
                 if degraded:
                     weights = ((torch.clip(torch.abs(interp_sparse - self.temp_even_img_sparse), 0, 1) - 1)**6 ).flatten().unsqueeze(-1)
                     jacobian = jacobian * weights
@@ -1126,9 +1304,8 @@ class Dro():
             if not degraded:
                 vel, _, _ = self.motion_model.getVelPosRot(state, with_jac=False)
                 self.previous_vel = torch.norm(vel[-1,:])
-                self.max_diff_vel = self.motion_model.time[-1] * self.max_acc
-            
-            
+                self.max_diff_vel = self.delta_time * self.max_acc
+
             return state
 
     # Helper function to get the local map indices from the cartesian coordinates

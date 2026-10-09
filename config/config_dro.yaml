@@ -29,9 +29,14 @@ estimation:
   estimate_gyro_bias: false
   use_gyro: true
   vy_bias_prior: 0.11
+  smooth_vy: false # Low-pass filtering of the lateral velocity
+  vy_smoothing_alpha: 0.2 # vy = alpha*vy_new + (1-alpha)*vy_prev (the smaller the alpha, the stronger the smoothing)
   min_time_bias_init: 1.0
   gyro_bias_alpha: 0.01
   max_acceleration: 10.0
+  # Rejection of the Doppler sectors inconsistent with the predicted ego-motion (e.g. moving vehicles)
+  doppler_outlier_rejection: true
+  doppler_outlier_tol_vel: 2.6 # Max radial velocity difference (m/s) between a sector and the prediction to be kept
 gp:
   lengthscale_az: 2.0
   lengthscale_range: 4.0
@@ -41,6 +46,7 @@ log:
   save_images: false
   save_local_maps: false
   save_cumulative_image: false
+  save_diagnostics: false # Per-scan number of residuals and of Doppler sectors rejected as outliers
   verbose: true
   save_scans: false
   max_scan_range: 120.0

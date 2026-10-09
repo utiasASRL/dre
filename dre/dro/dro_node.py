@@ -86,6 +86,9 @@ class DroNode(Node):
         self.imu_data_buffer = []
 
         self.last_imu_time = None
+        # Last azimuth timestamp of the previously processed radar scan (the IMU passed to DRO
+        # has to cover the time since then in case of radar drop out)
+        self.last_processed_radar_end = None
 
         self.initialized = False
         self.first = True
@@ -135,6 +138,7 @@ class DroNode(Node):
 
         self.dro = Dro(dro_opts, self)
         self.dro_opts = dro_opts
+        self.save_diagnostics = dro_opts['log']['save_diagnostics']
         self.bridge = CvBridge()
         self.get_logger().info("DRO ready")
 
@@ -180,6 +184,13 @@ class DroNode(Node):
             if os.path.exists(self.cumulative_return_output_path):
                 os.system('rm -r ' + self.cumulative_return_output_path)
             os.makedirs(self.cumulative_return_output_path)
+
+        # Per-scan diagnostics: number of residuals of each cost and Doppler sectors rejected as outliers
+        if self.save_diagnostics:
+            self.diagnostics_output_path = os.path.join(self.seq_output_folder, "diagnostics")
+            os.makedirs(self.diagnostics_output_path, exist_ok=True)
+            self.residuals_log_file = open(os.path.join(self.diagnostics_output_path, "nb_residuals.csv"), 'w')
+            self.residuals_log_file.write("timestamp_scan (us),nb_doppler,nb_direct,doppler_valid_sectors,doppler_rejected_sectors\n")
 
         self.initialized = True
 
@@ -255,8 +266,12 @@ class DroNode(Node):
         self.pending_radar_wait_start = None
 
         # Get the minimum number of IMU measurements that cover the radar timestamps
+        # (and the time since the end of the previous scan, needed if some scans were dropped)
         imu_times = np.array([imu['timestamp'] for imu in self.imu_data_buffer])
-        start_idx = np.searchsorted(imu_times, first_radar_time, side='left')
+        imu_start_time = first_radar_time
+        if self.last_processed_radar_end is not None:
+            imu_start_time = min(first_radar_time, self.last_processed_radar_end)
+        start_idx = np.searchsorted(imu_times, imu_start_time, side='left')
         start_idx = max(0, start_idx - 1)  # Ensure at least one IMU before the radar timestamps
         end_idx = np.searchsorted(imu_times, last_radar_time, side='right')
         end_idx = min(len(imu_times), end_idx + 1)  # Ensure at least one IMU after the radar timestamps
@@ -287,18 +302,19 @@ class DroNode(Node):
         self.logOdometry(current_odometry, self.radar_data_buffer[0]['timestamp'])
 
 
+        if self.save_diagnostics:
+            self.logDiagnostics(self.radar_data_buffer[0]['timestamp'])
+
         # Clear the first radar
         temp_last_time = self.radar_data_buffer[0]['timestamps'][-1]
+        self.last_processed_radar_end = temp_last_time
         # Remove the processed radar from the buffer
         self.radar_data_buffer.pop(0)
 
-        # Remove the IMU measurements to keep at least one IMU before the next radar timestamps
-        if len(self.radar_data_buffer) > 0:
-            next_radar_time = self.radar_data_buffer[0]['timestamps'][0]
-        else:
-            next_radar_time = temp_last_time
-        next_start_idx = np.searchsorted(imu_times, next_radar_time, side='left')
-        self.imu_data_buffer = self.imu_data_buffer[next_start_idx - 1:]  # Keep one IMU before the next radar
+        # Remove the IMU measurements to keep at least one IMU before the end of the processed
+        # radar (the next scan starts after it, potentially much later in case of drop out)
+        next_start_idx = np.searchsorted(imu_times, temp_last_time, side='left')
+        self.imu_data_buffer = self.imu_data_buffer[max(0, next_start_idx - 1):]
 
 
 
@@ -346,6 +362,14 @@ class DroNode(Node):
             df_odom.to_csv(self.odometry_output_path, header=None, index=None, sep=' ')
         else:
             df_odom.to_csv(self.odometry_output_path, mode='a', header=None, index=None, sep=' ')
+
+
+    def logDiagnostics(self, timestamp):
+        nb_doppler, nb_direct = self.dro.getNbResiduals()
+        stats = self.dro.doppler_outlier_stats
+        outliers = 'nan,nan' if stats is None else f'{stats[0]},{stats[1]}'
+        self.residuals_log_file.write(f"{int(timestamp)},{nb_doppler},{nb_direct},{outliers}\n")
+        self.residuals_log_file.flush()
 
 
     def logOdometry3D(self, poses, timestamps):
