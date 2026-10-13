@@ -15,13 +15,9 @@ kDefaultDroOpts = {
         'estimate_gyro_bias': False,
         'estimate_vy_bias': False,
         'vy_bias_prior': 0.0,
-        'max_acceleration': 10.0,
         'min_time_bias_init': 1.0,
         'T_axle_radar': np.eye(4),
         'gyro_bias_alpha': 0.01,
-        # Low-pass filtering of the lateral velocity
-        'smooth_vy': False,
-        'vy_smoothing_alpha': 1.0,
         # Rejection of the Doppler sectors inconsistent with the ego-motion (e.g. moving vehicles)
         'doppler_outlier_rejection': False,
         'doppler_outlier_tol_vel': 2.6,
@@ -79,7 +75,6 @@ class Dro():
             self.kImgPadding = 200
             self.kOptFirstStep = 0.1
 
-            self.max_diff_vel = opts['estimation']['max_acceleration'] * 0.25
             # Time between the beginning of the previous scan and the current one (s)
             self.delta_time = 0.25
 
@@ -99,11 +94,6 @@ class Dro():
             self.estimate_vy_bias = opts['estimation']['estimate_vy_bias']
             self.vy_bias = opts['estimation']['vy_bias_prior']
 
-            # Optional low-pass filtering of the lateral velocity
-            # (vy = alpha*vy_new + (1-alpha)*vy_prev, the smaller the alpha the stronger the smoothing)
-            self.smooth_vy = bool(opts['estimation']['smooth_vy'])
-            self.vy_smoothing_alpha = float(opts['estimation']['vy_smoothing_alpha'])
-            self.vy_smoothed = None
             self.save_local_maps = opts['log']['save_local_maps']
             self.save_cumulative_image = opts['log']['save_cumulative_image']
 
@@ -169,10 +159,6 @@ class Dro():
 
             self.current_rot = torch.tensor(0.0).to(self.device).double()
             self.current_pos = torch.zeros(2).to(self.device).double()
-
-            self.max_acc = torch.tensor(float(opts['estimation']['max_acceleration'])).to(self.device)
-
-            self.previous_vel = torch.tensor(0.0).to(self.device)
 
             self.step_counter = 0
 
@@ -355,14 +341,10 @@ class Dro():
         # Warm up the first-step optimisation path as executed in odometryStep.
         saved_step_counter = self.step_counter
         saved_state_init = self.state_init.clone()
-        saved_previous_vel = self.previous_vel.clone()
-        saved_max_diff_vel = self.max_diff_vel.clone() if isinstance(self.max_diff_vel, torch.Tensor) else self.max_diff_vel
         self.step_counter = 0
         _ = self.solve(self.state_init.clone(), nb_iter=self.opts['solver']['nb_iter'], cost_tol=self.opts['solver']['cost_tol'], step_tol=self.opts['solver']['step_tol'])
         self.step_counter = saved_step_counter
         self.state_init = saved_state_init
-        self.previous_vel = saved_previous_vel
-        self.max_diff_vel = saved_max_diff_vel
         # The fake timestamps must not be used as the previous scan's time
         self.timestamps = None
 
@@ -402,7 +384,6 @@ class Dro():
             scan_duration = int(timestamps[-1] - timestamps[0])
             if self.timestamps is None:
                 last_scan_time = int(timestamps[0]) - scan_duration
-                self.max_diff_vel = self.max_acc * scan_duration * 1e-6
             else:
                 last_scan_time = self.timestamps[0].item()
             self.timestamps = torch.tensor(timestamps).to(self.device).squeeze()
@@ -608,8 +589,6 @@ class Dro():
                 self.state_init[:2] = self.state_init[:2]*(1+self.state_init[2]*delta_time)
             if torch.norm(self.state_init[:2]) < 0.75:
                 self.state_init[:] = 0.0
-                # Reset the lateral velocity filter to avoid dragging the previous motion
-                self.vy_smoothed = None
 
             # Reject the Doppler sectors inconsistent with the predicted ego-motion
             self.doppler_az_weight_sparse = None
@@ -619,18 +598,6 @@ class Dro():
 
             result = self.solve(self.state_init, self.opts['solver']['nb_iter'], self.opts['solver']['cost_tol'], self.opts['solver']['step_tol'])
 
-
-            # Check if the the angular velocity is not too high
-            # If it is, we set it to the previous value (preventing potential catastrophic failure)
-            if isinstance(self.motion_model, ConstVelConstW):
-                if self.step_counter > 0:
-                    if torch.abs(result[2]) > maxAngVel(result[:2]):
-                        result[2] = self.prev_state[2]
-                self.prev_state = result.clone()
-
-            # Low-pass filter the lateral velocity if enabled
-            if self.smooth_vy:
-                result[1] = self.smoothVy(result[1])
 
             # Update the vy bias if needed
             if self.use_doppler and self.estimate_vy_bias and np.linalg.norm(result[:2].cpu().numpy()) > 3.0:
@@ -679,15 +646,6 @@ class Dro():
             self.prev_chirp_up = self.chirp_up
             self.step_counter += 1
             return result.detach().cpu().numpy()
-
-
-    # Low-pass filter of the lateral velocity (first order IIR)
-    def smoothVy(self, vy):
-        if self.vy_smoothed is None:
-            self.vy_smoothed = vy.clone()
-        else:
-            self.vy_smoothed = self.vy_smoothing_alpha * vy + (1 - self.vy_smoothing_alpha) * self.vy_smoothed
-        return self.vy_smoothed.clone()
 
 
     # Velocities (n, 2) with the lateral velocity bias (fully applied above 3 m/s, proportional to the
@@ -1043,7 +1001,7 @@ class Dro():
         
 
     # Cost function and Jacobian for the Doppler and direct cost functions
-    def costFunctionAndJacobian(self, state, doppler, direct, degraded=False):
+    def costFunctionAndJacobian(self, state, doppler, direct):
         with torch.no_grad():
             state_size = len(state)
             velocities, d_vel_d_state, pos, d_pos_d_state, rot, d_rot_d_state = self.motion_model.getVelPosRot(state, with_jac=True)
@@ -1069,9 +1027,6 @@ class Dro():
                     residual = residual * self.doppler_az_weight_sparse
                     jacobian = jacobian * self.doppler_az_weight_sparse.unsqueeze(-1)
 
-                if degraded:
-                    weights = ((torch.clip(torch.abs(interp_sparse - self.temp_even_img_sparse), 0, 1) - 1)**6 ).flatten().unsqueeze(-1)
-                    jacobian = jacobian * weights
             # Direct cost
             if direct:
                 cart_corrected_sparse, x_rot, y_rot, d_cart_d_shift = self.polarToCartCoordCorrectionSparse(pos, rot, shifts)
@@ -1096,9 +1051,6 @@ class Dro():
                 d_interp = d_interp_direct_d_xy_sparse.reshape((-1, 2))
                 jacobian_direct = ((d_interp[:, 0:1] / (-self.local_map_res)) * d_cart_sparse_d_state[:, 0, :]
                                    + (d_interp[:, 1:2] / self.local_map_res) * d_cart_sparse_d_state[:, 1, :]) * self.polar_intensity_sparse.unsqueeze(-1)
-                if degraded:
-                    weights_direct = ((torch.clip(torch.abs(interp_direct_sparse - self.polar_intensity_sparse), 0, 1) - 1)**6 ).flatten().unsqueeze(-1)
-                    jacobian_direct = jacobian_direct * weights_direct
 
 
             if doppler and direct:
@@ -1221,7 +1173,7 @@ class Dro():
 
 
     # Gradient ascent solver for the state estimation
-    def solve(self, state_init, nb_iter=20, cost_tol=1e-6, step_tol=1e-6, degraded=False, doppler_only=False):
+    def solve(self, state_init, nb_iter=20, cost_tol=1e-6, step_tol=1e-6, doppler_only=False):
         with torch.no_grad():
             # As there is no local map yet at the first scan, we remove the angular velocity
             # from the state (if any)
@@ -1246,7 +1198,7 @@ class Dro():
             last_increasing_state = state.clone()
             last_increasing_grad = torch.zeros_like(state)
             for i in range(nb_iter):
-                res, jac = self.costFunctionAndJacobian(state, self.use_doppler, (not doppler_only) and (self.step_counter > 0), degraded)
+                res, jac = self.costFunctionAndJacobian(state, self.use_doppler, (not doppler_only) and (self.step_counter > 0))
 
                 if remove_angular:
                     jac = jac[:, :-1]
@@ -1283,19 +1235,6 @@ class Dro():
                 if stop_after_step:
                     break
                 prev_cost = cost
-
-
-            vel, _, _ = self.motion_model.getVelPosRot(state, with_jac=False)
-            try_degraded = (isinstance(self.motion_model, ConstVelConstW)) and (torch.abs(state[2]) > maxAngVel(state[:2]))
-            try_degraded = try_degraded or (torch.abs(torch.norm(vel[-1,:]) - self.previous_vel) > self.max_diff_vel)
-            if try_degraded:
-                if not degraded:
-                    state = self.solve(state_init, nb_iter=nb_iter, cost_tol=cost_tol, step_tol=step_tol, degraded=True)
-
-            if not degraded:
-                vel, _, _ = self.motion_model.getVelPosRot(state, with_jac=False)
-                self.previous_vel = torch.norm(vel[-1,:])
-                self.max_diff_vel = self.delta_time * self.max_acc
 
             return state
 
@@ -1381,22 +1320,4 @@ class Dro():
 
             return pose
 
-
-
-# Euristic on the maximum angular velocity acceptable for a given velocity
-# (used to detect degraded mode when not using a gyro)
-def maxAngVel(vel):
-    min_ang_vel = 0.15
-    max_ang_vel = 1.0
-    max_vel = 20
-    min_vel = 10
-    vel_norm = torch.norm(vel)
-    if vel_norm < min_vel:
-        return max_ang_vel
-    elif vel_norm > max_vel:
-        return min_ang_vel
-    else:
-        a = (min_ang_vel - max_ang_vel) / (max_vel - min_vel)
-        b = max_ang_vel - a*min_vel 
-        return a*vel_norm + b
 
